@@ -1,5 +1,6 @@
 import torch
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +185,9 @@ def patched_model_map(model: str):
 
     if model == "zai-org/GLM-4.5-Air":
         patched = True
-        model_name = "artifacts/models/GLM-4.5-Air"
+        model_name = os.environ.get(
+            "REAP_GLM_MODEL_PATH", "artifacts/models/GLM-4.5-Air"
+        )
 
     if model == "zai-org/GLM-4.5-Air-FP8":
         patched = True

@@ -39,6 +39,11 @@ from reap.layerwise_model_utils import (
 )
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 from reap.metrics import OnlineStatsTracker
+from reap.router_stability import (
+    RouterObservation,
+    RouterStabilityCollector,
+    collect_router_observation,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -196,6 +201,18 @@ class LayerwiseMoEObserver:
 
         # Forward signature cache per block
         self._forward_signature_cache: Dict[int, Tuple[set[str], bool]] = {}
+        self.router_stability: RouterStabilityCollector | None = None
+        if hook_config.collect_router_stability:
+            if hook_config.router_stability_output_dir is None:
+                raise ValueError("router_stability_output_dir is required")
+            self.router_stability = RouterStabilityCollector(
+                hook_config.router_stability_output_dir,
+                hook_config.router_stability_variance_multipliers,
+                hook_config.router_stability_seed,
+                hook_config.router_stability_boundary_width,
+                hook_config.router_stability_max_tokens,
+            )
+        self._batch_offset = 0
 
         logger.info(
             f"LayerwiseMoEObserver initialized with {len(self.block_names)} blocks"
@@ -568,6 +585,7 @@ class LayerwiseMoEObserver:
         input_hidden_states: torch.Tensor,
         device: torch.device,
         attention_mask: torch.Tensor | None = None,
+        batch_id: int = 0,
     ):
         """
         Process MoE activations and compute pruning metrics.
@@ -637,6 +655,34 @@ class LayerwiseMoEObserver:
         # Compute activations for all experts
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
+        router_module = getattr(moe_module, "gate", None)
+        if router_module is None:
+            router_module = getattr(moe_module, "router", None)
+        stability_observation = None
+        if self.router_stability is not None and router_module is not None:
+            if flat_input.numel() > 0:
+                stability_observation = collect_router_observation(
+                    router_module,
+                    flat_input,
+                    self.router_stability.variance_multipliers,
+                    self.router_stability.generator,
+                    top_k=top_k,
+                    boundary=self.router_stability.boundary,
+                )
+                event_observation = stability_observation
+                if valid_token_mask is not None:
+                    mask = valid_token_mask.to(device).bool()
+                    event_observation = RouterObservation(
+                        top12_ids=stability_observation.top12_ids[:, mask],
+                        top12_ranking_values=stability_observation.top12_ranking_values[:, mask],
+                        top8_applied_weights=stability_observation.top8_applied_weights[:, mask],
+                        original_scores=stability_observation.original_scores[mask],
+                        perturbed_scores=stability_observation.perturbed_scores[:, mask],
+                        original_selected=stability_observation.original_selected[mask],
+                        perturbed_selected=stability_observation.perturbed_selected[:, mask],
+                    )
+                self.router_stability.observe(block_idx, batch_id, event_observation)
+
         # TODO(ivanl): model-specific handling of router_module return signature
         def extract_router_logits(router_module, input):
             """Call routers that expect either flattened or sequence-shaped hidden states.
@@ -697,6 +743,12 @@ class LayerwiseMoEObserver:
             for idx, expert in enumerate(moe_module.experts):
                 activations[idx] = expert(flat_input).to(device)
 
+        if stability_observation is not None:
+            selected_experts = stability_observation.original_selected.to(device)
+            # GLM's generic MoE output can expose only selected routing values;
+            # stability collection already computed the full expert vector.
+            router_logits = stability_observation.original_scores.to(device)
+
         update_pruning_state(
             self.state[block_idx],
             activations=activations,
@@ -718,7 +770,7 @@ class LayerwiseMoEObserver:
         self,
         block_idx: int,
         before_forward: Optional[Callable[[], None]] = None,
-        after_forward: Optional[Callable[[torch.device, Optional[torch.Tensor]], None]] = None,
+        after_forward: Optional[Callable[[torch.device, Optional[torch.Tensor], int], None]] = None,
     ) -> Dict[str, Any]:
         """Forward cached hidden states through a single transformer block."""
         block_name = (
@@ -775,7 +827,11 @@ class LayerwiseMoEObserver:
                     hidden_states = outputs
 
                 if after_forward is not None:
-                    after_forward(target_device, attention_mask)
+                    after_forward(
+                        target_device,
+                        attention_mask,
+                        self._batch_offset + batch_idx,
+                    )
 
                 block_outputs.append([hidden_states.detach().cpu()])
 
@@ -828,6 +884,7 @@ class LayerwiseMoEObserver:
         def _after_forward(
             target_device: torch.device,
             attention_mask: Optional[torch.Tensor],
+            batch_id: int,
         ) -> None:
             moe_input = captured_moe_input.get("input")
             if moe_input is None:
@@ -839,6 +896,7 @@ class LayerwiseMoEObserver:
                 moe_input,
                 target_device,
                 attention_mask=attention_mask,
+                batch_id=batch_id,
             )
 
             del moe_input
@@ -932,7 +990,10 @@ class LayerwiseMoEObserver:
             Dictionary mapping block numbers to their metrics
         """
         if batch_group_size is None or batch_group_size >= len(data_batches):
-            return self._record_all_blocks_for_batch_group(data_batches, save_path)
+            result = self._record_all_blocks_for_batch_group(data_batches, save_path)
+            if self.router_stability is not None:
+                self.router_stability.finalize()
+            return result
 
         if batch_group_size < 1:
             raise ValueError("batch_group_size must be at least 1 when provided")
@@ -962,8 +1023,11 @@ class LayerwiseMoEObserver:
                 data_batches=batch_group,
                 save_path=group_save_path,
             )
+            self._batch_offset = end
             cleanup_memory()
 
+        if self.router_stability is not None:
+            self.router_stability.finalize()
         return self.report_state()
 
     def report_state(self) -> Dict[int, Dict[str, Any]]:
@@ -1007,6 +1071,7 @@ class LayerwiseMoEObserver:
         self.state = {}
         self._moe_modules_cache.clear()
         self.replay_cache.clear()
+        self._batch_offset = 0
         cleanup_memory(synchronize=False)
         logger.debug("Observer state reset")
 

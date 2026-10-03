@@ -223,6 +223,12 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
+    collect_router_stability: bool = False
+    router_stability_output_dir: str | None = None
+    router_stability_max_tokens: int | None = None
+    router_stability_variance_multipliers: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
+    router_stability_seed: int = 42
+    router_stability_boundary_width: int = 4
 
 
 class MoETransformerObserver(BaseTransformerObserver):
