@@ -173,6 +173,14 @@ def record_activations_layerwise(
     hook_config = OBSERVER_CONFIG_REGISTRY[model_class_name](
         renormalize_router_weights=obs_args.renormalize_router_weights,
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
+        collect_router_stability=obs_args.collect_router_stability,
+        router_stability_output_dir=obs_args.router_stability_output_dir,
+        router_stability_max_tokens=obs_args.router_stability_max_tokens,
+        router_stability_variance_multipliers=tuple(
+            obs_args.router_stability_variance_multipliers
+        ),
+        router_stability_seed=obs_args.router_stability_seed,
+        router_stability_boundary_width=obs_args.router_stability_boundary_width,
     )
 
     # Create layerwise observer

@@ -146,6 +146,30 @@ class ObserverArgs:
             )
         }, 
     )
+    collect_router_stability: bool = field(
+        default=False,
+        metadata={"help": "Collect streaming router-stability data."},
+    )
+    router_stability_output_dir: str | None = field(
+        default=None,
+        metadata={"help": "Directory for router-stability Parquet and accumulators."},
+    )
+    router_stability_max_tokens: int | None = field(
+        default=None,
+        metadata={"help": "Stop router-stability collection after this many valid tokens."},
+    )
+    router_stability_variance_multipliers: list[float] = field(
+        default_factory=lambda: [0.25, 0.5, 1.0, 2.0],
+        metadata={"help": "Four relative noise-variance multipliers."},
+    )
+    router_stability_seed: int = field(
+        default=42,
+        metadata={"help": "Random seed for router-stability noise."},
+    )
+    router_stability_boundary_width: int = field(
+        default=4,
+        metadata={"help": "Number of experts retained beyond top-k."},
+    )
 
 @dataclass
 class ClusterArgs:
