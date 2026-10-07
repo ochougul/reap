@@ -44,6 +44,7 @@ from reap.router_stability import (
     RouterStabilityCollector,
     collect_router_observation,
 )
+from reap.seap import SeapCollector, collect_seap_observation
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -202,6 +203,7 @@ class LayerwiseMoEObserver:
         # Forward signature cache per block
         self._forward_signature_cache: Dict[int, Tuple[set[str], bool]] = {}
         self.router_stability: RouterStabilityCollector | None = None
+        self.seap: SeapCollector | None = None
         if hook_config.collect_router_stability:
             if hook_config.router_stability_output_dir is None:
                 raise ValueError("router_stability_output_dir is required")
@@ -211,6 +213,14 @@ class LayerwiseMoEObserver:
                 hook_config.router_stability_seed,
                 hook_config.router_stability_boundary_width,
                 hook_config.router_stability_max_tokens,
+            )
+        if hook_config.collect_seap:
+            if hook_config.seap_output_dir is None:
+                raise ValueError("seap_output_dir is required when collecting SEAP")
+            self.seap = SeapCollector(
+                hook_config.seap_output_dir,
+                deltas=(2.0, 4.0),
+                seed=hook_config.seap_seed,
             )
         self._batch_offset = 0
 
@@ -683,6 +693,23 @@ class LayerwiseMoEObserver:
                     )
                 self.router_stability.observe(block_idx, batch_id, event_observation)
 
+        if self.seap is not None and router_module is not None and flat_input.numel() > 0:
+            seap_observation = collect_seap_observation(
+                router_module,
+                flat_input,
+                self.seap.generator(device, block_idx),
+                variance_multiplier=self.hook_config.seap_variance_multiplier,
+                top_k=top_k,
+            )
+            if valid_token_mask is not None:
+                mask = valid_token_mask.to(device).bool().cpu()
+                seap_observation = type(seap_observation)(
+                    original_selected=seap_observation.original_selected[mask],
+                    original_ranks=seap_observation.original_ranks[mask],
+                    perturbed_ranks=seap_observation.perturbed_ranks[mask],
+                )
+            self.seap.observe(block_idx, seap_observation, int(num_experts))
+
         # TODO(ivanl): model-specific handling of router_module return signature
         def extract_router_logits(router_module, input):
             """Call routers that expect either flattened or sequence-shaped hidden states.
@@ -993,6 +1020,17 @@ class LayerwiseMoEObserver:
             result = self._record_all_blocks_for_batch_group(data_batches, save_path)
             if self.router_stability is not None:
                 self.router_stability.finalize()
+            if self.seap is not None:
+                result = self.seap.add_scores_to_state(
+                    result,
+                    delta=self.hook_config.seap_delta,
+                    lambda_=self.hook_config.seap_lambda,
+                )
+                self.seap.save(
+                    result,
+                    delta=self.hook_config.seap_delta,
+                    lambda_=self.hook_config.seap_lambda,
+                )
             return result
 
         if batch_group_size < 1:
@@ -1028,7 +1066,19 @@ class LayerwiseMoEObserver:
 
         if self.router_stability is not None:
             self.router_stability.finalize()
-        return self.report_state()
+        result = self.report_state()
+        if self.seap is not None:
+            result = self.seap.add_scores_to_state(
+                result,
+                delta=self.hook_config.seap_delta,
+                lambda_=self.hook_config.seap_lambda,
+            )
+            self.seap.save(
+                result,
+                delta=self.hook_config.seap_delta,
+                lambda_=self.hook_config.seap_lambda,
+            )
+        return result
 
     def report_state(self) -> Dict[int, Dict[str, Any]]:
         """

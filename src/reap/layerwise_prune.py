@@ -181,6 +181,12 @@ def record_activations_layerwise(
         ),
         router_stability_seed=obs_args.router_stability_seed,
         router_stability_boundary_width=obs_args.router_stability_boundary_width,
+        collect_seap=obs_args.collect_seap,
+        seap_output_dir=obs_args.seap_output_dir,
+        seap_delta=obs_args.seap_delta,
+        seap_lambda=obs_args.seap_lambda,
+        seap_variance_multiplier=obs_args.seap_variance_multiplier,
+        seap_seed=obs_args.seap_seed,
     )
 
     # Create layerwise observer

@@ -170,6 +170,12 @@ class ObserverArgs:
         default=4,
         metadata={"help": "Number of experts retained beyond top-k."},
     )
+    collect_seap: bool = field(default=False, metadata={"help": "Collect SEAP scores."})
+    seap_output_dir: str | None = field(default=None)
+    seap_delta: float = field(default=2.0)
+    seap_lambda: float = field(default=0.5)
+    seap_variance_multiplier: float = field(default=2.0)
+    seap_seed: int = field(default=42)
 
 @dataclass
 class ClusterArgs:
@@ -522,6 +528,7 @@ class PruneArgs:
                 "weighted_ean_sum_l2",
                 "reap",
                 "reap_l2",
+                "seap",
                 "max_activations"
             ]
         },

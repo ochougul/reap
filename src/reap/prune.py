@@ -71,6 +71,8 @@ def prune(
             "reap",
             "reap_l2",
             "weighted_ean_sum_l2",
+            "seap",
+            "stability_score",
         ]
         for layer in observer_data:
             super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][:, 1]

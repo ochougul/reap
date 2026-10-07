@@ -229,6 +229,12 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     router_stability_variance_multipliers: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
     router_stability_seed: int = 42
     router_stability_boundary_width: int = 4
+    collect_seap: bool = False
+    seap_output_dir: str | None = None
+    seap_delta: float = 2.0
+    seap_lambda: float = 0.5
+    seap_variance_multiplier: float = 2.0
+    seap_seed: int = 42
 
 
 class MoETransformerObserver(BaseTransformerObserver):
