@@ -149,11 +149,13 @@ class SeapCollector:
             normalized = reap / reap.max() if reap.numel() and reap.max() > 0 else torch.zeros_like(reap)
             delta_index = min(range(len(self.deltas)), key=lambda i: abs(self.deltas[i] - delta))
             state[layer]["stability_score"] = stability[delta_index]
+            for index, stored_delta in enumerate(self.deltas):
+                state[layer][f"stability_score_delta_{stored_delta:g}"] = stability[index]
             state[layer]["stability_scores"] = stability
             state[layer]["reap_score"] = reap
             state[layer]["normalized_reap"] = normalized
             state[layer]["seap_score"] = (
-                lambda_ * stability[delta_index] + (1.0 - lambda_) * normalized
+                lambda_ * normalized + (1.0 - lambda_) * stability[delta_index]
             )
         return state
 

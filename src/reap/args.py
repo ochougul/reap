@@ -505,6 +505,10 @@ class EvalArgs:
             "help": "Number of parallel tasks to run during evalplus evaluation."
         },
     )
+    eval_limit: int | None = field(
+        default=None,
+        metadata={"help": "Limit evaluation examples for smoke tests."},
+    )
 
 @dataclass
 class PruneArgs:

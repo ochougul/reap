@@ -234,6 +234,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 numpy_random_seed=seed,
                 torch_random_seed=seed,
                 batch_size=eval_args.parallel_tasks if not is_ernie else 1,
+                limit=eval_args.eval_limit,
                 apply_chat_template=False,
                 fewshot_as_multiturn=False,
             )
@@ -247,6 +248,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 random_seed=seed,
                 numpy_random_seed=seed,
                 torch_random_seed=seed,
+                limit=eval_args.eval_limit,
                 apply_chat_template=False,
                 fewshot_as_multiturn=False,
             )

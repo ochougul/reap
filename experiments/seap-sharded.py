@@ -21,9 +21,16 @@ from reap.router_stability import _route_once
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 
 
-MODEL_PATH = "/local/mnt2/workspace/ochougul/artifacts/models/GLM-4.5-Air"
+MODEL_PATH = os.environ.get(
+    "SEAP_MODEL_PATH", "/local/mnt2/workspace/ochougul/artifacts/models/GLM-4.5-Air"
+)
 OUTPUT_DIR = pathlib.Path(os.environ.get("SEAP_OUTPUT_DIR", "artifacts/seap/glm4.5-air-500k"))
-MAX_TOKENS = int(os.environ.get("SEAP_MAX_TOKENS", "500000"))
+DATASET_NAME = os.environ.get("SEAP_DATASET_NAME", "theblackcat102/evol-codealpaca-v1")
+DATASET_SPLIT = os.environ.get("SEAP_SPLIT", "train")
+BATCH_SIZE = int(os.environ.get("SEAP_BATCH_SIZE", "1"))
+BATCHES_PER_CATEGORY = int(os.environ.get("SEAP_BATCHES_PER_CATEGORY", "256"))
+MAX_TOKENS = int(os.environ.get("SEAP_MAX_TOKENS", "500000")) or None
+SEED = int(os.environ.get("SEAP_SEED", "42"))
 
 
 def build_device_map(config):
@@ -42,7 +49,7 @@ def build_device_map(config):
 
 
 def main() -> None:
-    set_seed(42)
+    set_seed(SEED)
     config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
@@ -54,13 +61,13 @@ def main() -> None:
     ).eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
     batches = next(iter(load_category_batches(
-        dataset_name="theblackcat102/evol-codealpaca-v1", split="train", subset=None,
-        tokenizer=tokenizer, model_max_length=2048, batch_size=1,
+        dataset_name=DATASET_NAME, split=DATASET_SPLIT, subset=None,
+        tokenizer=tokenizer, model_max_length=2048, batch_size=BATCH_SIZE,
         split_by_category=False, return_vllm_tokens_prompt=False,
-        truncate=True, batches_per_category=256,
+        truncate=True, batches_per_category=BATCHES_PER_CATEGORY,
     ).values()))
 
-    collector = SeapCollector(OUTPUT_DIR, deltas=(2.0, 4.0), seed=42)
+    collector = SeapCollector(OUTPUT_DIR, deltas=(2.0, 4.0), seed=SEED)
     total_tokens = 0
     current = {"mask": None, "batch": 0}
     reap_state = {}
@@ -111,7 +118,7 @@ def main() -> None:
             model(**{key: value.to(input_device) if torch.is_tensor(value) else value
                      for key, value in batch.items()}, use_cache=False, return_dict=True)
             total_tokens += int(current["mask"].sum()) if current["mask"] is not None else 0
-            if total_tokens >= MAX_TOKENS:
+            if MAX_TOKENS is not None and total_tokens >= MAX_TOKENS:
                 break
     for handle in handles:
         handle.remove()
@@ -119,7 +126,19 @@ def main() -> None:
     state = collector.add_scores_to_state(reap_state, delta=2.0, lambda_=0.5)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(state, OUTPUT_DIR / "seap_state.pt")
-    collector.save(state, {"total_tokens": total_tokens, "variance_multiplier": 2.0}, delta=2.0, lambda_=0.5)
+    collector.save(
+        state,
+        {
+            "total_tokens": total_tokens,
+            "variance_multiplier": 2.0,
+            "dataset_name": DATASET_NAME,
+            "split": DATASET_SPLIT,
+            "batch_size": BATCH_SIZE,
+            "batches_per_category": BATCHES_PER_CATEGORY,
+        },
+        delta=2.0,
+        lambda_=0.5,
+    )
 
 
 if __name__ == "__main__":

@@ -94,6 +94,8 @@ def prune(
             prune_method = prune_args.prune_method
             if prune_method == "frequency":
                 prune_method = "expert_frequency"
+            elif prune_method == "seap":
+                prune_method = "seap_score"
             saliency_data = observer_data[layer].get(prune_method)
             if saliency_data is None:
                 raise ValueError(
@@ -133,6 +135,10 @@ def prune(
                 router.e_score_correction_bias.data = (
                     router.e_score_correction_bias.data[retained_expert_indicies]
                 )
+            if hasattr(router, "n_routed_experts"):
+                router.n_routed_experts = len(retained_expert_indicies)
+            if hasattr(moe, "num_experts"):
+                moe.num_experts = len(retained_expert_indicies)
             setattr(moe, model_attrs["router"], router)
         else:
             # prune fused experts, only tested for llama-4
