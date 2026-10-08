@@ -28,7 +28,8 @@ OUTPUT_DIR = pathlib.Path(os.environ.get("SEAP_OUTPUT_DIR", "artifacts/seap/glm4
 DATASET_NAME = os.environ.get("SEAP_DATASET_NAME", "theblackcat102/evol-codealpaca-v1")
 DATASET_SPLIT = os.environ.get("SEAP_SPLIT", "train")
 BATCH_SIZE = int(os.environ.get("SEAP_BATCH_SIZE", "1"))
-BATCHES_PER_CATEGORY = int(os.environ.get("SEAP_BATCHES_PER_CATEGORY", "256"))
+# Match experiments/pruning-cli.sh, the original REAP calibration path.
+BATCHES_PER_CATEGORY = int(os.environ.get("SEAP_BATCHES_PER_CATEGORY", "1024"))
 MODEL_MAX_LENGTH = int(os.environ.get("SEAP_MODEL_MAX_LENGTH", "2048"))
 # Match REAP's ObserverArgs default: overlong examples are skipped, not
 # truncated. This keeps the sampled calibration examples identical.
