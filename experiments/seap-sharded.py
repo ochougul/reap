@@ -29,6 +29,10 @@ DATASET_NAME = os.environ.get("SEAP_DATASET_NAME", "theblackcat102/evol-codealpa
 DATASET_SPLIT = os.environ.get("SEAP_SPLIT", "train")
 BATCH_SIZE = int(os.environ.get("SEAP_BATCH_SIZE", "1"))
 BATCHES_PER_CATEGORY = int(os.environ.get("SEAP_BATCHES_PER_CATEGORY", "256"))
+MODEL_MAX_LENGTH = int(os.environ.get("SEAP_MODEL_MAX_LENGTH", "2048"))
+# Match REAP's ObserverArgs default: overlong examples are skipped, not
+# truncated. This keeps the sampled calibration examples identical.
+TRUNCATE = os.environ.get("SEAP_TRUNCATE", "false").lower() in {"1", "true", "yes"}
 MAX_TOKENS = int(os.environ.get("SEAP_MAX_TOKENS", "500000")) or None
 SEED = int(os.environ.get("SEAP_SEED", "42"))
 
@@ -62,9 +66,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True, local_files_only=True)
     batches = next(iter(load_category_batches(
         dataset_name=DATASET_NAME, split=DATASET_SPLIT, subset=None,
-        tokenizer=tokenizer, model_max_length=2048, batch_size=BATCH_SIZE,
+        tokenizer=tokenizer, model_max_length=MODEL_MAX_LENGTH, batch_size=BATCH_SIZE,
         split_by_category=False, return_vllm_tokens_prompt=False,
-        truncate=True, batches_per_category=BATCHES_PER_CATEGORY,
+        truncate=TRUNCATE, batches_per_category=BATCHES_PER_CATEGORY,
     ).values()))
 
     collector = SeapCollector(OUTPUT_DIR, deltas=(2.0, 4.0), seed=SEED)
@@ -135,6 +139,10 @@ def main() -> None:
             "split": DATASET_SPLIT,
             "batch_size": BATCH_SIZE,
             "batches_per_category": BATCHES_PER_CATEGORY,
+            "model_max_length": MODEL_MAX_LENGTH,
+            "truncate": TRUNCATE,
+            "split_by_category": False,
+            "seed": SEED,
         },
         delta=2.0,
         lambda_=0.5,
