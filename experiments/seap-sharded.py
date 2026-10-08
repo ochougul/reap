@@ -28,13 +28,18 @@ OUTPUT_DIR = pathlib.Path(os.environ.get("SEAP_OUTPUT_DIR", "artifacts/seap/glm4
 DATASET_NAME = os.environ.get("SEAP_DATASET_NAME", "theblackcat102/evol-codealpaca-v1")
 DATASET_SPLIT = os.environ.get("SEAP_SPLIT", "train")
 BATCH_SIZE = int(os.environ.get("SEAP_BATCH_SIZE", "1"))
-# Match experiments/pruning-cli.sh, the original REAP calibration path.
+FULL_DATASET = os.environ.get("SEAP_FULL_DATASET", "false").lower() in {"1", "true", "yes"}
+# Match experiments/pruning-cli.sh unless full-dataset mode is requested.
 BATCHES_PER_CATEGORY = int(os.environ.get("SEAP_BATCHES_PER_CATEGORY", "1024"))
+if FULL_DATASET:
+    # load_category_batches stops after exhausting the dataset when this
+    # exceeds the available sample count.
+    BATCHES_PER_CATEGORY = 10**12
 MODEL_MAX_LENGTH = int(os.environ.get("SEAP_MODEL_MAX_LENGTH", "2048"))
 # Match REAP's ObserverArgs default: overlong examples are skipped, not
 # truncated. This keeps the sampled calibration examples identical.
 TRUNCATE = os.environ.get("SEAP_TRUNCATE", "false").lower() in {"1", "true", "yes"}
-MAX_TOKENS = int(os.environ.get("SEAP_MAX_TOKENS", "500000")) or None
+MAX_TOKENS = int(os.environ.get("SEAP_MAX_TOKENS", "0" if FULL_DATASET else "500000")) or None
 SEED = int(os.environ.get("SEAP_SEED", "42"))
 
 
@@ -140,6 +145,7 @@ def main() -> None:
             "split": DATASET_SPLIT,
             "batch_size": BATCH_SIZE,
             "batches_per_category": BATCHES_PER_CATEGORY,
+            "full_dataset": FULL_DATASET,
             "model_max_length": MODEL_MAX_LENGTH,
             "truncate": TRUNCATE,
             "split_by_category": False,
