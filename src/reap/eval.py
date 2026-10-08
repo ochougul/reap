@@ -1,4 +1,5 @@
 import logging
+import atexit
 from typing import Tuple
 import pathlib
 import os
@@ -194,15 +195,33 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
     logger.info(f"Results will be saved to {results_dir}")
     num_gpus = torch.cuda.device_count()
     model_name = patched_model_map(model_name)
+    process = None
     if use_server:
-        server_endpoint, process = start_server(
-            model_name,
-            model_args,
-            eval_args,
-            seed,
-            log_file=eval_args.server_log_file_name,
-            port=eval_args.vllm_port,
-        )
+        try:
+            server_endpoint, process = start_server(
+                model_name,
+                model_args,
+                eval_args,
+                seed,
+                log_file=eval_args.server_log_file_name,
+                port=eval_args.vllm_port,
+            )
+        except Exception:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+
+    def terminate_server():
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    atexit.register(terminate_server)
 
     if eval_args.run_lm_eval:
         results_file_base_name = results_dir / "lm_eval_results"
@@ -406,10 +425,7 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             logger.error(f"An error occurred during math evaluation: {e}")
             pass
 
-    if use_server:
-        process.terminate()
-    if use_server and "process" in locals():
-        process.terminate()
+    terminate_server()
 
 
 if __name__ == "__main__":
