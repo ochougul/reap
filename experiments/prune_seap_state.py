@@ -27,6 +27,7 @@ def parse_args():
     parser.add_argument("--state-path", required=True)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     parser.add_argument("--compression-ratio", type=float, default=0.25)
+    parser.add_argument("--prune-method", choices=("seap", "reap"), default="seap")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-smoke-test", action="store_true")
     parser.add_argument("--run-eval", action="store_true")
@@ -92,8 +93,22 @@ def main():
         return
 
     state = torch.load(args.state_path, weights_only=False)
+    if args.prune_method == "reap":
+        # The combined SEAP state stores the legacy OnlineStatsTracker under
+        # `reap` and its materialized tensor under `reap_score`.
+        for layer in state.values():
+            reap_score = layer.get("reap_score")
+            if reap_score is None:
+                reap = layer.get("reap")
+                reap_score = getattr(reap, "mean", reap)
+            if reap_score is None:
+                raise KeyError("State is missing reap_score/reap for REAP pruning")
+            layer["reap"] = reap_score
     first_layer = next(iter(state.values()))
-    total_experts = int(first_layer["seap_score"].shape[0])
+    score_key = "seap_score" if args.prune_method == "seap" else "reap_score"
+    if score_key not in first_layer:
+        raise KeyError(f"State is missing {score_key}, required for {args.prune_method} pruning")
+    total_experts = int(first_layer[score_key].shape[0])
     n_experts_to_prune = int(total_experts * args.compression_ratio)
     if not 0 <= n_experts_to_prune < total_experts:
         raise ValueError("compression ratio must prune at least 0 and fewer than all experts")
@@ -101,13 +116,17 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        device_map="auto",
+        # Checkpoint creation mutates expert/router tensor shapes.  Loading
+        # with device_map="auto" installs Accelerate offload hooks whose
+        # stale original shapes can make save_pretrained fail after pruning.
+        # This model fits comfortably in host RAM, so keep it on CPU here.
+        device_map="cpu",
         torch_dtype="auto",
         trust_remote_code=True,
         low_cpu_mem_usage=True,
         local_files_only=True,
     ).eval()
-    prune_args = PruneArgs(prune_method="seap", n_experts_to_prune=n_experts_to_prune)
+    prune_args = PruneArgs(prune_method=args.prune_method, n_experts_to_prune=n_experts_to_prune)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     temporary = None
     if args.save_checkpoint:

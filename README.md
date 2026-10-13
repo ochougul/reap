@@ -129,6 +129,13 @@ zero-mean Gaussian perturbations. The perturbation variance is relative to the
 per-token input variance, using multipliers `0.25`, `0.5`, `1.0`, and `2.0`.
 This is a data-collection method only; it does not assign a pruning score.
 
+### SEAP calibration, lambda sweeps, and evaluation
+
+See [SEAP_EXPERIMENTS.md](SEAP_EXPERIMENTS.md) for the portable workflow to
+calibrate on a different dataset, construct arbitrary `lambda`/`delta` score
+states offline, prune with either SEAP or REAP, and evaluate on selected
+lm-eval, EvalPlus, or LiveCodeBench tasks.
+
 For every routing event, the collector records the eight selected experts plus
 the next four boundary experts. It records correction-adjusted ranking values
 for all twelve experts and the final normalized/scaled applied weights for the

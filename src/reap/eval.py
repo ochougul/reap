@@ -45,6 +45,25 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         if key in model_name:
             original_model = value
             break
+    # Temporary pruned checkpoints do not retain the original model name in
+    # their path.  Recover it from the checkpoint config so downstream
+    # evaluators (notably LiveCodeBench) can select the correct prompt/model
+    # style.
+    if original_model is None:
+        config_path = pathlib.Path(model_name) / "config.json"
+        if config_path.exists():
+            try:
+                with config_path.open() as f:
+                    config = json.load(f)
+                    config_name = config.get("_name_or_path", "")
+                for key, value in original_model_name_map.items():
+                    if key in config_name:
+                        original_model = value
+                        break
+                if original_model is None and "glm4" in config.get("model_type", "").lower():
+                    original_model = original_model_name_map["GLM-4.5-Air"]
+            except (OSError, json.JSONDecodeError):
+                pass
     uncompressed_model = False
     if original_model is None:
         # it's an uncompressed model or bad path

@@ -75,8 +75,8 @@ seap_i(lambda, delta)
 
 Interpretation:
 
-- `lambda=1`: stability only;
-- `lambda=0`: normalized REAP only;
+- `lambda=1`: normalized REAP only;
+- `lambda=0`: stability only;
 - intermediate values: combined score;
 - higher SEAP means “preserve this expert.”
 
