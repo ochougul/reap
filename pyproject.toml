@@ -18,8 +18,8 @@ dependencies = [
     "python-dotenv>=1.1.0",
     "seaborn>=0.13.2",
     "torch==2.7.1",
-    # "transformers==4.53.3",  # latest version working for ernie.
-    "transformers==4.55.0",
+    "tqdm>=4.67.0",
+    "transformers>=5.8.0",
     "umap-learn>=0.5.7",
     "vllm==0.10.0",
     "livecodebench",

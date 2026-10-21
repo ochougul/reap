@@ -54,9 +54,18 @@ def _route_once(router: torch.nn.Module, hidden_states: torch.Tensor, top_k: int
         logits, scores, ranking_values = _glm_route(router, hidden_states)
     else:
         result = router(hidden_states)
-        logits = result[-1] if isinstance(result, tuple) else result
-        scores = logits.float()
-        ranking_values = scores
+        if isinstance(result, tuple):
+            # Modern MoE routers return (router_logits, routing_weights,
+            # selected_experts).  The previous generic path accidentally used
+            # selected expert ids as logits, which is particularly harmful for
+            # Qwen4-Exp's 512-way router.
+            logits = result[0]
+            scores = torch.softmax(logits.float(), dim=-1)
+            ranking_values = scores
+        else:
+            logits = result
+            scores = logits.float()
+            ranking_values = scores
 
     top12 = min(top_k + boundary, ranking_values.shape[-1])
     top12_values, top12_ids = ranking_values.topk(top12, dim=-1, sorted=True)

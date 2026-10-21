@@ -236,6 +236,7 @@ def load_category_batches(
     return_vllm_tokens_prompt,
     truncate,
     batches_per_category,
+    pack_samples=True,
 ):
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
@@ -251,6 +252,7 @@ def load_category_batches(
     processor = proc_cls(
         dataset=raw_ds,
         tokenizer=tokenizer,
+        pack_samples=pack_samples,
         max_input_len=model_max_length,
         split=split,
         split_by_category=split_by_category,
