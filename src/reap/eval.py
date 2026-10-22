@@ -29,6 +29,7 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
     original_model_name_map = {
         "Mixtral-8x7B-Instruct-v0.1": "mistralai/Mixtral-8x7B-Instruct-v0.1",
         "Qwen3-30B-A3B": "Qwen/Qwen3-30B-A3B",
+        "Qwen3.5-122B-A10B": "Qwen/Qwen3.5-122B-A10B",
         "Llama-4-Scout-17B-16E-Instruct": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         "ERNIE-4.5-21B-A3B-PT": "baidu/ERNIE-4.5-21B-A3B-PT",
         "DeepSeek-V2-Lite-Chat": "deepseek-ai/DeepSeek-V2-Lite-Chat",

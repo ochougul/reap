@@ -1,0 +1,58 @@
+{
+  "status": "passed",
+  "configuration": {
+    "batch_size": 11,
+    "max_length": 2048,
+    "allocator_override": false,
+    "gpu_limits": [
+      "59GiB",
+      "64GiB",
+      "64GiB",
+      "64GiB"
+    ]
+  },
+  "workload": {
+    "processed_sequences": 100,
+    "forward_passes": 10,
+    "valid_tokens": 204706,
+    "elapsed_seconds": 207.84
+  },
+  "gpu_peak_memory": [
+    {
+      "gpu": 0,
+      "peak_memory_mib": 80265,
+      "peak_memory_gib": 78.384,
+      "headroom_mib": 887,
+      "headroom_gib": 0.866,
+      "peak_utilization_pct": 88
+    },
+    {
+      "gpu": 1,
+      "peak_memory_mib": 77361,
+      "peak_memory_gib": 75.548,
+      "headroom_mib": 3791,
+      "headroom_gib": 3.702,
+      "peak_utilization_pct": 87
+    },
+    {
+      "gpu": 2,
+      "peak_memory_mib": 77477,
+      "peak_memory_gib": 75.661,
+      "headroom_mib": 3675,
+      "headroom_gib": 3.589,
+      "peak_utilization_pct": 87
+    },
+    {
+      "gpu": 3,
+      "peak_memory_mib": 79345,
+      "peak_memory_gib": 77.485,
+      "headroom_mib": 1807,
+      "headroom_gib": 1.765,
+      "peak_utilization_pct": 100
+    }
+  ],
+  "state_validation": {
+    "layers": 48,
+    "finite_scores": true
+  }
+}

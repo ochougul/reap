@@ -116,10 +116,21 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "Qwen3_5MoeForConditionalGeneration": {
+        "moe_block": "mlp",
+        "experts": "experts",
+        "fused": True,
+        "packed_experts": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
 
 
 def get_moe(model, layer):
+    if model.__class__.__name__ == "Qwen3_5MoeForConditionalGeneration":
+        return model.model.language_model.layers[layer].mlp
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
     return getattr(model.model.layers[layer], moe_attr_name)
 

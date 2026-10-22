@@ -1,0 +1,5 @@
+gpu,peak_memory_mib,peak_memory_gib,headroom_mib,headroom_gib,peak_utilization_pct
+0,80265,78.384,887,0.866,88
+1,77361,75.548,3791,3.702,87
+2,77477,75.661,3675,3.589,87
+3,79345,77.485,1807,1.765,100

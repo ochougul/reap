@@ -111,7 +111,29 @@ def prune(
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+        if model_attrs.get("packed_experts", False):
+            # Qwen3.5 packs routed-expert weights into rank-three parameters
+            # rather than a ModuleList. The shared expert remains untouched.
+            retained = torch.tensor(
+                retained_expert_indicies,
+                device=moe.experts.gate_up_proj.device,
+                dtype=torch.long,
+            )
+            moe.experts.gate_up_proj = torch.nn.Parameter(
+                moe.experts.gate_up_proj.detach().index_select(0, retained).contiguous()
+            )
+            moe.experts.down_proj = torch.nn.Parameter(
+                moe.experts.down_proj.detach().index_select(0, retained).contiguous()
+            )
+            moe.experts.num_experts = len(retained_expert_indicies)
+            router = getattr(moe, model_attrs["router"])
+            router.weight = torch.nn.Parameter(
+                router.weight.detach().index_select(0, retained).contiguous()
+            )
+            router.num_experts = len(retained_expert_indicies)
+            if router.top_k > router.num_experts:
+                raise ValueError("Cannot prune Qwen3.5 below its router top-k")
+        elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -155,7 +177,10 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    if model_attrs.get("packed_experts", False):
+        model.config.text_config.num_experts = retained_experts
+    else:
+        setattr(model.config, model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,

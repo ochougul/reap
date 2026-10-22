@@ -27,7 +27,13 @@ import logging
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
-from vllm import TokensPrompt
+
+try:
+    from vllm import TokensPrompt
+except ModuleNotFoundError:
+    # Calibration only uses BatchEncoding. Keeping this optional lets the
+    # Qwen3.5 calibration environment avoid an unrelated vLLM dependency.
+    TokensPrompt = None
 
 
 logger = logging.getLogger(__name__)
@@ -206,7 +212,7 @@ def parse_composite_dataset_spec(
     return components
 
 
-def _load_raw_dataset(dataset_name, split, subset=None):
+def _load_raw_dataset(dataset_name, split, subset=None, revision=None):
     """Load a raw HuggingFace dataset, handling special cases like C4."""
     try:
         if dataset_name == "allenai/c4":
@@ -217,7 +223,9 @@ def _load_raw_dataset(dataset_name, split, subset=None):
         else:
             load_kwargs = {}
             if subset is not None:
-                load_kwargs = {"name": subset}
+                load_kwargs["name"] = subset
+            if revision is not None:
+                load_kwargs["revision"] = revision
             return load_dataset(dataset_name, split=split, **load_kwargs)
     except Exception as e:
         raise RuntimeError(
@@ -236,8 +244,10 @@ def load_category_batches(
     return_vllm_tokens_prompt,
     truncate,
     batches_per_category,
+    revision=None,
+    return_packing_stats=False,
 ):
-    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
+    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset, revision=revision)
 
     # load dataset processor
     proc_cls = DATASET_REGISTRY.get(dataset_name)
@@ -261,6 +271,8 @@ def load_category_batches(
     category_data_batches = processor.get_processed_dataset(
         batches_per_category=batches_per_category,
     )
+    if return_packing_stats:
+        return category_data_batches, processor.packing_stats
     return category_data_batches
 
 
@@ -330,6 +342,7 @@ class BaseDatasetProcessor(ABC):
             select_only_categories = [select_only_categories]
         self.select_only_categories = select_only_categories
         self.batch_size = batch_size
+        self.packing_stats: dict[str, dict[str, int]] = {}
         if self.select_only_categories:
             logger.warning(
                 "select_only_categories is not None but split_by_category "
@@ -532,39 +545,77 @@ class BaseDatasetProcessor(ABC):
         batches_per_category: int,
         category_dataset: Dataset,
     ) -> list[TokensPrompt] | list[BatchEncoding]:
+        """Pack whole samples into fixed-length sequences.
+
+        When truncation is disabled, a sample that fits the configured maximum
+        length but not the remaining space is carried into the next sequence.
+        Only samples longer than the configured maximum are skipped. This
+        keeps calibration inputs faithful to the requested non-truncating
+        policy.
+        """
         processed_samples = []
-        sampled = []
+        sampled: set[int] = set()
         current_batch = []
+        pending_sample: tuple[int, torch.Tensor] | None = None
+        packed_sequences = 0
+        eligible_source_rows = 0
+        eligible_source_tokens = 0
+        skipped_source_rows = 0
+        skipped_source_tokens = 0
         while len(processed_samples) < batches_per_category:
-            if len(sampled) >= len(category_dataset):
+            if len(sampled) >= len(category_dataset) and pending_sample is None:
                 logger.warning(
                     f"Not enough samples in category '{category}' to reach "
-                    f"{batches_per_category} data batches. Only {len(sampled)} "
-                    "samples were processed.",
+                    f"{batches_per_category} packed data batches. Only {len(sampled)} "
+                    "source samples were processed."
                 )
                 break
             seq = torch.zeros((1, self.max_input_len), dtype=torch.long)
             seq_idx = 0
             attention_mask = torch.zeros((1, self.max_input_len), dtype=torch.long)
             while seq_idx < self.max_input_len:
-                if len(sampled) >= len(category_dataset):
-                    logger.warning(
-                        f"Not enough samples to pack last sequence to max_input_len."
-                    )
-                    break
-                sample_idx = random.randint(0, len(category_dataset) - 1)
-                if sample_idx in sampled:
-                    continue
-                sampled.append(sample_idx)
-                sample = category_dataset[sample_idx]
-                encoded_sample = self._encode_sample(sample)  # shape (batch, seq)
-                end_seq = seq_idx + encoded_sample.shape[-1]
+                if pending_sample is None:
+                    if len(sampled) >= len(category_dataset):
+                        break
+                    sample_idx = random.randint(0, len(category_dataset) - 1)
+                    if sample_idx in sampled:
+                        continue
+                    sample = category_dataset[sample_idx]
+                    encoded_sample = self._encode_sample(sample)
+                else:
+                    sample_idx, encoded_sample = pending_sample
+                    pending_sample = None
+
+                sample_length = encoded_sample.shape[-1]
+                if sample_length > self.max_input_len:
+                    sampled.add(sample_idx)
+                    if self.truncate:
+                        encoded_sample = encoded_sample[:, : self.max_input_len]
+                        sample_length = self.max_input_len
+                    else:
+                        skipped_source_rows += 1
+                        skipped_source_tokens += sample_length
+                        continue
+
+                end_seq = seq_idx + sample_length
                 if end_seq > self.max_input_len:
-                    encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]
-                    end_seq = self.max_input_len
+                    if self.truncate:
+                        encoded_sample = encoded_sample[:, : self.max_input_len - seq_idx]
+                        end_seq = self.max_input_len
+                    else:
+                        pending_sample = (sample_idx, encoded_sample)
+                        break
+
+                sampled.add(sample_idx)
+                eligible_source_rows += 1
+                eligible_source_tokens += sample_length
                 seq[:, seq_idx:end_seq] = encoded_sample
                 attention_mask[:, seq_idx:end_seq] = 1
                 seq_idx = end_seq + 1
+
+            if seq_idx == 0:
+                continue
+            packed_sequences += 1
             if self.return_vllm_tokens_prompt:
                 encoded_sample = TokensPrompt(
                     prompt_token_ids=seq[0, :-1].tolist()  # -1 for vLLM.LLM.generate
@@ -579,11 +630,18 @@ class BaseDatasetProcessor(ABC):
                     processed_samples.append(batched)
                     current_batch = []
 
-        # handle remaining samples in the last batch
         if current_batch and not self.return_vllm_tokens_prompt:
             batched = self._collate_batch(current_batch)
             processed_samples.append(batched)
 
+        self.packing_stats[category] = {
+            "source_rows": len(sampled),
+            "eligible_source_rows": eligible_source_rows,
+            "eligible_source_tokens": eligible_source_tokens,
+            "skipped_source_rows_over_max_length": skipped_source_rows,
+            "skipped_source_tokens_over_max_length": skipped_source_tokens,
+            "packed_sequences": packed_sequences,
+        }
         return processed_samples
 
 

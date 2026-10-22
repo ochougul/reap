@@ -1,0 +1,162 @@
+[
+  {
+    "delta": 2.0,
+    "lambda": 0.0,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.4541015625,
+    "min_overlap_fraction": 0.015625,
+    "max_overlap_fraction": 0.6875
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.0,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.6930338541666666,
+    "min_overlap_fraction": 0.3359375,
+    "max_overlap_fraction": 0.8359375
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.25,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.5263671875,
+    "min_overlap_fraction": 0.03125,
+    "max_overlap_fraction": 0.765625
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.25,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.7555338541666666,
+    "min_overlap_fraction": 0.3671875,
+    "max_overlap_fraction": 0.875
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.5,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.634765625,
+    "min_overlap_fraction": 0.0625,
+    "max_overlap_fraction": 0.859375
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.5,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.8302408854166666,
+    "min_overlap_fraction": 0.390625,
+    "max_overlap_fraction": 0.9296875
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.75,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.7942708333333334,
+    "min_overlap_fraction": 0.140625,
+    "max_overlap_fraction": 0.921875
+  },
+  {
+    "delta": 2.0,
+    "lambda": 0.75,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.9117838541666666,
+    "min_overlap_fraction": 0.4375,
+    "max_overlap_fraction": 0.9609375
+  },
+  {
+    "delta": 2.0,
+    "lambda": 1.0,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 1.0,
+    "min_overlap_fraction": 1.0,
+    "max_overlap_fraction": 1.0
+  },
+  {
+    "delta": 2.0,
+    "lambda": 1.0,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 1.0,
+    "min_overlap_fraction": 1.0,
+    "max_overlap_fraction": 1.0
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.0,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.4501953125,
+    "min_overlap_fraction": 0.015625,
+    "max_overlap_fraction": 0.734375
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.0,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.6925455729166666,
+    "min_overlap_fraction": 0.359375,
+    "max_overlap_fraction": 0.8515625
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.25,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.517578125,
+    "min_overlap_fraction": 0.03125,
+    "max_overlap_fraction": 0.796875
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.25,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.7516276041666666,
+    "min_overlap_fraction": 0.359375,
+    "max_overlap_fraction": 0.9140625
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.5,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.6119791666666666,
+    "min_overlap_fraction": 0.046875,
+    "max_overlap_fraction": 0.84375
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.5,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.8214518229166666,
+    "min_overlap_fraction": 0.3828125,
+    "max_overlap_fraction": 0.9375
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.75,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 0.7766927083333334,
+    "min_overlap_fraction": 0.140625,
+    "max_overlap_fraction": 0.921875
+  },
+  {
+    "delta": 4.0,
+    "lambda": 0.75,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 0.90380859375,
+    "min_overlap_fraction": 0.4140625,
+    "max_overlap_fraction": 0.96875
+  },
+  {
+    "delta": 4.0,
+    "lambda": 1.0,
+    "prune_fraction": 0.25,
+    "mean_overlap_fraction": 1.0,
+    "min_overlap_fraction": 1.0,
+    "max_overlap_fraction": 1.0
+  },
+  {
+    "delta": 4.0,
+    "lambda": 1.0,
+    "prune_fraction": 0.5,
+    "mean_overlap_fraction": 1.0,
+    "min_overlap_fraction": 1.0,
+    "max_overlap_fraction": 1.0
+  }
+]

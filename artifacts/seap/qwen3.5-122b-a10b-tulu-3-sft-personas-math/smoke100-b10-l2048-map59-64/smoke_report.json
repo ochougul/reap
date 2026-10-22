@@ -1,0 +1,71 @@
+{
+  "status": "passed",
+  "configuration": {
+    "batch_size": 10,
+    "max_length": 2048,
+    "allocator_override": false,
+    "per_gpu_device_map_limits": {
+      "gpu0": "59GiB",
+      "gpu1": "64GiB",
+      "gpu2": "64GiB",
+      "gpu3": "64GiB"
+    },
+    "layer_ranges": {
+      "gpu0": "0-10",
+      "gpu1": "11-23",
+      "gpu2": "24-36",
+      "gpu3": "37-47"
+    }
+  },
+  "workload": {
+    "rows": 100,
+    "forwards": 10,
+    "valid_tokens": 204706,
+    "elapsed_seconds": 207.94,
+    "end_to_end_tokens_per_second": 984.45
+  },
+  "gpu_peak_memory": [
+    {
+      "gpu": 0,
+      "peak_memory_mib": 77945,
+      "peak_memory_gib": 76.118,
+      "capacity_pct": 96.048,
+      "headroom_mib": 3207,
+      "headroom_gib": 3.132,
+      "peak_utilization_pct": 85
+    },
+    {
+      "gpu": 1,
+      "peak_memory_mib": 75969,
+      "peak_memory_gib": 74.188,
+      "capacity_pct": 93.613,
+      "headroom_mib": 5183,
+      "headroom_gib": 5.062,
+      "peak_utilization_pct": 84
+    },
+    {
+      "gpu": 2,
+      "peak_memory_mib": 76133,
+      "peak_memory_gib": 74.349,
+      "capacity_pct": 93.815,
+      "headroom_mib": 5019,
+      "headroom_gib": 4.901,
+      "peak_utilization_pct": 84
+    },
+    {
+      "gpu": 3,
+      "peak_memory_mib": 77095,
+      "peak_memory_gib": 75.288,
+      "capacity_pct": 95.001,
+      "headroom_mib": 4057,
+      "headroom_gib": 3.962,
+      "peak_utilization_pct": 100
+    }
+  ],
+  "state_validation": {
+    "layers": 48,
+    "finite_scores": true,
+    "shape_256": true,
+    "delta_4_ge_delta_2": true
+  }
+}

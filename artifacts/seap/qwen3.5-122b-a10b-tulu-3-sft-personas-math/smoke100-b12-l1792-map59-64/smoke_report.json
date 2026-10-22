@@ -1,0 +1,59 @@
+{
+  "status": "passed",
+  "configuration": {
+    "batch_size": 12,
+    "max_length": 1792,
+    "truncate": false,
+    "max_memory_gib": [
+      59,
+      64,
+      64,
+      64
+    ]
+  },
+  "workload": {
+    "processed_sequences": 100,
+    "forward_passes": 9,
+    "valid_tokens": 179122,
+    "elapsed_seconds": 191.44
+  },
+  "gpu_peak_memory": [
+    {
+      "gpu": 0,
+      "peak_memory_mib": 79117,
+      "peak_utilization_pct": 87,
+      "peak_memory_gib": 77.263,
+      "headroom_mib": 2803,
+      "headroom_gib": 2.737
+    },
+    {
+      "gpu": 1,
+      "peak_memory_mib": 76681,
+      "peak_utilization_pct": 86,
+      "peak_memory_gib": 74.884,
+      "headroom_mib": 5239,
+      "headroom_gib": 5.116
+    },
+    {
+      "gpu": 2,
+      "peak_memory_mib": 76825,
+      "peak_utilization_pct": 85,
+      "peak_memory_gib": 75.024,
+      "headroom_mib": 5095,
+      "headroom_gib": 4.976
+    },
+    {
+      "gpu": 3,
+      "peak_memory_mib": 78247,
+      "peak_utilization_pct": 100,
+      "peak_memory_gib": 76.413,
+      "headroom_mib": 3673,
+      "headroom_gib": 3.587
+    }
+  ],
+  "state_validation": {
+    "layers": 48,
+    "finite_scores": true,
+    "callback_parity": "exact_per_layer_router_frequency_match"
+  }
+}

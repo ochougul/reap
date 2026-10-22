@@ -52,21 +52,44 @@ def _glm_route(router: torch.nn.Module, hidden_states: torch.Tensor) -> tuple[to
 def _route_once(router: torch.nn.Module, hidden_states: torch.Tensor, top_k: int, boundary: int):
     if hasattr(router, "e_score_correction_bias") and hasattr(router, "n_group"):
         logits, scores, ranking_values = _glm_route(router, hidden_states)
+        selected_ids = None
+        selected_weights = None
     else:
         result = router(hidden_states)
-        logits = result[-1] if isinstance(result, tuple) else result
-        scores = logits.float()
-        ranking_values = scores
+        # Qwen3.5's router returns (logits, normalized_topk_weights, topk_ids).
+        # Preserve those exact selected weights; recomputing them from logits is
+        # easy to get wrong because Qwen renormalizes after its top-k operation.
+        if (
+            isinstance(result, tuple)
+            and len(result) == 3
+            and torch.is_tensor(result[0])
+            and torch.is_tensor(result[1])
+            and torch.is_tensor(result[2])
+            and not result[2].is_floating_point()
+        ):
+            logits, selected_weights, selected_ids = result
+            scores = torch.softmax(logits.float(), dim=-1)
+            ranking_values = logits.float()
+        else:
+            logits = result[-1] if isinstance(result, tuple) else result
+            scores = logits.float()
+            ranking_values = scores
+            selected_ids = None
+            selected_weights = None
 
     top12 = min(top_k + boundary, ranking_values.shape[-1])
     top12_values, top12_ids = ranking_values.topk(top12, dim=-1, sorted=True)
-    selected_ids = top12_ids[:, :top_k]
-    selected_scores = scores.gather(1, selected_ids)
-    if getattr(router, "norm_topk_prob", False):
-        selected_weights = selected_scores / (selected_scores.sum(-1, keepdim=True) + 1e-20)
-    else:
-        selected_weights = selected_scores
-    selected_weights = selected_weights * getattr(router, "routed_scaling_factor", 1.0)
+    if selected_ids is None:
+        selected_ids = top12_ids[:, :top_k]
+    if selected_weights is None:
+        selected_scores = scores.gather(1, selected_ids)
+        if getattr(router, "norm_topk_prob", False):
+            selected_weights = selected_scores / (
+                selected_scores.sum(-1, keepdim=True) + 1e-20
+            )
+        else:
+            selected_weights = selected_scores
+        selected_weights = selected_weights * getattr(router, "routed_scaling_factor", 1.0)
     return logits, scores, top12_ids, top12_values, selected_ids, selected_weights
 
 

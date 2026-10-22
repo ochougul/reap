@@ -12,7 +12,7 @@ import os
 import sys
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Qwen3_5MoeForConditionalGeneration
 from accelerate.hooks import remove_hook_from_module
 
 from reap.args import ClusterArgs, DatasetArgs, EvalArgs, ModelArgs, ObserverArgs, PruneArgs, ReapArgs
@@ -114,7 +114,13 @@ def main():
         raise ValueError("compression ratio must prune at least 0 and fewer than all experts")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)
+    model_loader = (
+        Qwen3_5MoeForConditionalGeneration
+        if config.model_type == "qwen3_5_moe"
+        else AutoModelForCausalLM
+    )
+    model = model_loader.from_pretrained(
         args.model_path,
         # Checkpoint creation mutates expert/router tensor shapes.  Loading
         # with device_map="auto" installs Accelerate offload hooks whose

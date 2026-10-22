@@ -159,6 +159,54 @@ class SeapCollector:
             )
         return state
 
+    def checkpoint_state(self) -> dict[str, Any]:
+        """Return all streaming state needed to resume a calibration exactly.
+
+        The pruning state itself is owned by the caller.  This method captures
+        the collector's CPU accumulators and per-device random-generator state,
+        which are otherwise not represented in a scored SEAP state.
+        """
+        return {
+            "deltas": self.deltas,
+            "seed": self.seed,
+            "stability_sum": {
+                layer: values.clone() for layer, values in self.stability_sum.items()
+            },
+            "original_selected_count": {
+                layer: values.clone()
+                for layer, values in self.original_selected_count.items()
+            },
+            "generator_states": {
+                device: generator.get_state().cpu()
+                for device, generator in self.generator_by_device.items()
+            },
+        }
+
+    def restore_checkpoint_state(self, checkpoint: dict[str, Any]) -> None:
+        """Restore streaming state saved by :meth:`checkpoint_state`."""
+        saved_deltas = tuple(float(value) for value in checkpoint["deltas"])
+        if saved_deltas != self.deltas:
+            raise ValueError(
+                f"Checkpoint deltas {saved_deltas} do not match collector deltas {self.deltas}"
+            )
+        if int(checkpoint["seed"]) != self.seed:
+            raise ValueError(
+                f"Checkpoint seed {checkpoint['seed']} does not match collector seed {self.seed}"
+            )
+        self.stability_sum = {
+            int(layer): values.cpu().clone()
+            for layer, values in checkpoint["stability_sum"].items()
+        }
+        self.original_selected_count = {
+            int(layer): values.cpu().clone()
+            for layer, values in checkpoint["original_selected_count"].items()
+        }
+        self.generator_by_device = {}
+        for device, state in checkpoint["generator_states"].items():
+            generator = torch.Generator(device=torch.device(device))
+            generator.set_state(state)
+            self.generator_by_device[device] = generator
+
     def save(
         self,
         state: dict[int, dict[str, Any]],

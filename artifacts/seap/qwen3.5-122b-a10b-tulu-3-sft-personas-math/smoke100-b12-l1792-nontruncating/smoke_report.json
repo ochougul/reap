@@ -1,0 +1,48 @@
+{
+  "status": "passed",
+  "workload": {
+    "processed_packed_sequences": 100,
+    "forward_passes": 9,
+    "valid_tokens": 128864,
+    "elapsed_seconds": 192.35
+  },
+  "source_packing": {
+    "source_rows": 149960,
+    "eligible_source_rows": 121,
+    "eligible_source_tokens": 153260,
+    "skipped_source_rows_over_max_length": 23,
+    "skipped_source_tokens_over_max_length": 48769,
+    "prepared_packed_sequences": 120
+  },
+  "gpu_peak_memory": [
+    {
+      "gpu": 0,
+      "peak_memory_mib": 78213,
+      "peak_utilization_pct": 86,
+      "headroom_mib": 3707
+    },
+    {
+      "gpu": 1,
+      "peak_memory_mib": 76561,
+      "peak_utilization_pct": 84,
+      "headroom_mib": 5359
+    },
+    {
+      "gpu": 2,
+      "peak_memory_mib": 76667,
+      "peak_utilization_pct": 85,
+      "headroom_mib": 5253
+    },
+    {
+      "gpu": 3,
+      "peak_memory_mib": 77289,
+      "peak_utilization_pct": 100,
+      "headroom_mib": 4631
+    }
+  ],
+  "state_validation": {
+    "layers": 48,
+    "finite_scores": true,
+    "callback_parity": "exact_per_layer_router_frequency_match"
+  }
+}

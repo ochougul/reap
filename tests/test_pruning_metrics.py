@@ -1,6 +1,10 @@
 import torch
 
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    update_pruning_state,
+    update_pruning_state_from_selected_expert_outputs,
+)
 
 
 def test_update_pruning_state_filters_masked_tokens():
@@ -155,3 +159,52 @@ def test_update_pruning_state_renormalizes_selected_router_weights():
         layer_state["max_activations"],
         torch.tensor([15.0, 6.0, 24.0], dtype=torch.float32),
     )
+
+
+def test_selected_expert_outputs_match_dense_reap_accumulation():
+    activations = torch.tensor(
+        [
+            [[3.0, 4.0], [8.0, 15.0]],
+            [[0.0, 6.0], [0.0, 1.0]],
+            [[1.0, 0.0], [7.0, 24.0]],
+        ]
+    )
+    selected = torch.tensor([[0, 1], [2, 0]], dtype=torch.long)
+    logits = torch.tensor([[2.0, 1.0, 0.0], [1.0, 0.0, 2.0]])
+    dense_state = initialize_pruning_state(3)
+    sparse_state = initialize_pruning_state(3)
+
+    update_pruning_state(
+        dense_state,
+        activations=activations,
+        selected_experts=selected,
+        router_logits=logits,
+        num_experts=3,
+        renormalize_router_weights=True,
+    )
+    outputs = {
+        expert: activations[expert, (selected == expert).any(dim=-1)]
+        for expert in range(3)
+        if (selected == expert).any()
+    }
+    update_pruning_state_from_selected_expert_outputs(
+        sparse_state,
+        expert_outputs=outputs,
+        selected_experts=selected,
+        router_logits=logits,
+        num_experts=3,
+        renormalize_router_weights=True,
+    )
+
+    for key in (
+        "total_tokens",
+        "expert_frequency",
+        "pairwise_expert_frequency",
+        "ean_sum",
+        "weighted_ean_sum",
+        "weighted_expert_frequency_sum",
+        "max_activations",
+    ):
+        assert torch.allclose(dense_state[key], sparse_state[key])
+    assert torch.allclose(dense_state["ean_mean"].mean, sparse_state["ean_mean"].mean)
+    assert torch.allclose(dense_state["reap"].mean, sparse_state["reap"].mean)

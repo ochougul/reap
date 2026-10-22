@@ -69,8 +69,8 @@ The SEAP score is:
 
 ```text
 seap_i(lambda, delta)
-  = lambda * stability_i(delta)
-  + (1 - lambda) * normalized_reap_i
+  = lambda * normalized_reap_i
+  + (1 - lambda) * stability_i(delta)
 ```
 
 Interpretation:
@@ -279,8 +279,8 @@ Before expensive pruning runs, verify:
 - stability scores are finite and lie in `[0, 1]`;
 - experts with zero original selections have a defined score;
 - `delta=4` scores are never lower than `delta=2` scores for the same expert;
-- `lambda=0` reproduces normalized REAP ranking;
-- `lambda=1` reproduces stability ranking;
+- `lambda=1` reproduces normalized REAP ranking;
+- `lambda=0` reproduces stability ranking;
 - an expert with no rank movement has stability `1.0`;
 - an expert demoted by three positions gives `0.3679` at `delta=2`;
 - score ordering is deterministic under a fixed seed;
@@ -292,7 +292,7 @@ Before expensive pruning runs, verify:
 Compare the following using identical calibration and evaluation settings:
 
 1. Existing REAP.
-2. Stability-only (`lambda=1`).
+2. Stability-only (`lambda=0`).
 3. SEAP with `delta=2` and several lambda values.
 4. SEAP with `delta=4` and the same lambda values.
 

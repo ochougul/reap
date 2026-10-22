@@ -108,7 +108,7 @@ The current combination is:
 
 ```text
 normalized_reap = reap / max(reap in the layer)
-SEAP = lambda * stability + (1 - lambda) * normalized_reap
+SEAP = lambda * normalized_reap + (1 - lambda) * stability
 ```
 
 The completed run used `lambda=0.5`, `delta=2`, variance multiplier `2.0`, and
@@ -243,15 +243,15 @@ Do not rerun the expensive router pass for every lambda. Once full-dataset
 stability and normalized REAP are saved, derive SEAP offline:
 
 ```text
-seap(lambda) = lambda * stability
-             + (1 - lambda) * normalized_reap
+seap(lambda) = lambda * normalized_reap
+             + (1 - lambda) * stability
 ```
 
 Evaluate:
 
 ```text
 REAP baseline
-stability-only: lambda=1.0
+stability-only: lambda=0.0
 SEAP: lambda=0.0, 0.25, 0.5, 0.75, 1.0
 ```
 

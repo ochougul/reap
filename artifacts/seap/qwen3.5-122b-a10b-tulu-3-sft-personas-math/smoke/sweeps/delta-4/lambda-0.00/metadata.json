@@ -1,0 +1,6 @@
+{
+  "source_state": "artifacts/seap/qwen3.5-122b-a10b-tulu-3-sft-personas-math/smoke/calibration/seap_state.pt",
+  "delta": 4.0,
+  "lambda": 0.0,
+  "formula": "lambda * normalized_reap + (1 - lambda) * stability"
+}

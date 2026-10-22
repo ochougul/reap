@@ -214,3 +214,154 @@ def update_pruning_state(
     )
 
     return pruning_batch
+
+
+def update_pruning_state_from_selected_expert_outputs(
+    layer_state: dict[str, Any],
+    *,
+    expert_outputs: dict[int, torch.Tensor],
+    selected_experts: torch.Tensor,
+    router_logits: torch.Tensor,
+    num_experts: int,
+    renormalize_router_weights: bool = False,
+) -> None:
+    """Accumulate REAP without materializing all expert/token activations.
+
+    Packed-expert architectures such as Qwen3.5 store all expert weights in
+    rank-three tensors. Creating the conventional ``[experts, tokens, hidden]``
+    activation tensor for them is unnecessarily large: REAP only needs outputs
+    for experts selected by a token. ``expert_outputs`` therefore maps each
+    selected expert to its unweighted outputs for the tokens it served.
+    """
+    selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1])
+    router_logits = router_logits.reshape(-1, router_logits.shape[-1])
+    if router_logits.shape[1] != num_experts:
+        raise ValueError(
+            f"Expected router logits for {num_experts} experts, got {router_logits.shape[1]}"
+        )
+    if router_logits.shape[0] != selected_experts.shape[0]:
+        raise ValueError("Router logits and selected experts have different token counts")
+
+    device = router_logits.device
+    num_tokens = selected_experts.shape[0]
+    expert_frequency = torch.bincount(
+        selected_experts.reshape(-1), minlength=num_experts
+    ).to(device)
+    pairwise_expert_frequency = (
+        expert_frequency.unsqueeze(0) + expert_frequency.unsqueeze(1)
+    )
+    layer_state["total_tokens"] += torch.tensor(num_tokens, dtype=torch.long)
+    layer_state["expert_frequency"] += expert_frequency.to("cpu", torch.long)
+    layer_state["pairwise_expert_frequency"] += pairwise_expert_frequency.to(
+        "cpu", torch.long
+    )
+
+    routing_weights = torch.softmax(router_logits, dim=-1, dtype=torch.float)
+    if renormalize_router_weights and selected_experts.numel() > 0:
+        topk_weights = routing_weights.gather(1, selected_experts)
+        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_frequency = torch.zeros(num_experts, device=device, dtype=torch.float64)
+
+    for expert_index, output in expert_outputs.items():
+        if not 0 <= expert_index < num_experts:
+            raise ValueError(f"Invalid expert index {expert_index}")
+        active_mask = (selected_experts == expert_index).any(dim=-1)
+        if output.shape[0] != int(active_mask.sum()):
+            raise ValueError(
+                f"Expert {expert_index} has {output.shape[0]} outputs for "
+                f"{int(active_mask.sum())} selected tokens"
+            )
+        norms = torch.linalg.vector_norm(output, dim=-1)
+        weights = routing_weights[active_mask, expert_index]
+        ean_sum[expert_index] = norms.sum().double()
+        ean_mean[expert_index] = norms.mean()
+        weighted_frequency[expert_index] = weights.sum().double()
+        weighted_ean_sum[expert_index] = (norms * weights).sum().double()
+        reap[expert_index] = (norms * weights).mean()
+        layer_state["max_activations"][expert_index] = torch.maximum(
+            layer_state["max_activations"][expert_index], output.max().detach().cpu()
+        )
+
+    layer_state["ean_sum"] += ean_sum.cpu()
+    layer_state["ean_mean"].update(ean_mean.cpu(), expert_frequency.cpu())
+    layer_state["weighted_ean_sum"] += weighted_ean_sum.cpu()
+    layer_state["reap"].update(reap.cpu(), expert_frequency.cpu())
+    layer_state["weighted_expert_frequency_sum"] += weighted_frequency.cpu()
+
+
+def update_pruning_state_from_routed_outputs(
+    layer_state: dict[str, Any],
+    *,
+    expert_ids: torch.Tensor,
+    expert_outputs: torch.Tensor,
+    token_indices: torch.Tensor,
+    selected_experts: torch.Tensor,
+    router_logits: torch.Tensor,
+    num_experts: int,
+    renormalize_router_weights: bool = False,
+) -> None:
+    """Accumulate metrics from the model's already-computed routed outputs.
+
+    ``expert_outputs`` contains one row per selected token/expert pair, in the
+    same order as ``expert_ids``.  This avoids recomputing expert projections in
+    the observer while retaining the statistics produced by ``update_pruning_state``.
+    """
+    device = expert_outputs.device
+    selected_experts = selected_experts.reshape(-1, selected_experts.shape[-1]).to(device)
+    router_logits = router_logits.to(device)
+    expert_ids = expert_ids.reshape(-1).to(device=device, dtype=torch.long)
+    token_indices = token_indices.reshape(-1).to(device=device, dtype=torch.long)
+    if expert_outputs.shape[0] != expert_ids.numel() or token_indices.numel() != expert_ids.numel():
+        raise ValueError("Routed expert outputs and routing indices must have matching rows")
+    if router_logits.shape[0] != selected_experts.shape[0]:
+        raise ValueError("Router logits and selected experts must have matching tokens")
+
+    frequencies = torch.bincount(selected_experts.reshape(-1), minlength=num_experts)
+    layer_state["total_tokens"] += torch.tensor(
+        selected_experts.shape[0], device="cpu", dtype=torch.long
+    )
+    layer_state["expert_frequency"] += frequencies.cpu()
+    layer_state["pairwise_expert_frequency"] += (
+        frequencies.unsqueeze(0) + frequencies.unsqueeze(1)
+    ).cpu()
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
+    if renormalize_router_weights and selected_experts.numel() > 0:
+        topk_weights = torch.gather(routing_weights, 1, selected_experts)
+        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+        routing_weights = torch.clamp(
+            routing_weights, min=torch.finfo(routing_weights.dtype).eps
+        )
+
+    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    weighted_frequency = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    metric_frequency = torch.bincount(expert_ids, minlength=num_experts)
+
+    for expert_id in torch.unique(expert_ids).tolist():
+        rows = expert_ids == expert_id
+        activations = expert_outputs[rows]
+        token_ids = token_indices[rows]
+        norms = torch.linalg.vector_norm(activations, dim=-1)
+        weights = routing_weights[token_ids, expert_id]
+        ean_sum[expert_id] = norms.sum()
+        ean_mean[expert_id] = norms.mean()
+        weighted_frequency[expert_id] = weights.sum()
+        weighted_ean_sum[expert_id] = (norms * weights).sum()
+        reap[expert_id] = (norms * weights).mean()
+        max_activation = activations.max().to(device="cpu")
+        if max_activation > layer_state["max_activations"][expert_id]:
+            layer_state["max_activations"][expert_id] = max_activation
+
+    layer_state["ean_sum"] += ean_sum.cpu()
+    layer_state["ean_mean"].update(ean_mean.cpu(), metric_frequency.cpu())
+    layer_state["weighted_ean_sum"] += weighted_ean_sum.cpu()
+    layer_state["reap"].update(reap.cpu(), metric_frequency.cpu())
+    layer_state["weighted_expert_frequency_sum"] += weighted_frequency.cpu()

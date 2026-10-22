@@ -1,0 +1,71 @@
+{
+  "status": "passed",
+  "purpose": "100-row smoke to measure stable batch capacity at 2,048 tokens using the latest callback calibration runner.",
+  "configuration": {
+    "batch_size": 10,
+    "max_length": 2048,
+    "truncate": false,
+    "allocator": "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+    "gpus": "4 x NVIDIA A100 80 GB"
+  },
+  "workload": {
+    "processed_rows": 100,
+    "processed_batches": 10,
+    "valid_tokens": 204706,
+    "elapsed_seconds": 217.24,
+    "tokens_per_second_end_to_end": 942.3
+  },
+  "gpu_peak_memory": [
+    {
+      "gpu": 0,
+      "samples": 332,
+      "peak_memory_mib": 77867,
+      "peak_memory_gib": 76.042,
+      "peak_memory_pct_of_80gb": 95.952,
+      "headroom_mib": 3285,
+      "headroom_gib": 3.208,
+      "peak_utilization_pct": 85
+    },
+    {
+      "gpu": 1,
+      "samples": 332,
+      "peak_memory_mib": 80025,
+      "peak_memory_gib": 78.149,
+      "peak_memory_pct_of_80gb": 98.611,
+      "headroom_mib": 1127,
+      "headroom_gib": 1.101,
+      "peak_utilization_pct": 84
+    },
+    {
+      "gpu": 2,
+      "samples": 332,
+      "peak_memory_mib": 80035,
+      "peak_memory_gib": 78.159,
+      "peak_memory_pct_of_80gb": 98.624,
+      "headroom_mib": 1117,
+      "headroom_gib": 1.091,
+      "peak_utilization_pct": 83
+    },
+    {
+      "gpu": 3,
+      "samples": 332,
+      "peak_memory_mib": 47175,
+      "peak_memory_gib": 46.069,
+      "peak_memory_pct_of_80gb": 58.132,
+      "headroom_mib": 33977,
+      "headroom_gib": 33.181,
+      "peak_utilization_pct": 100
+    }
+  ],
+  "state_validation": {
+    "layers": 48,
+    "all_score_vectors_finite": true,
+    "all_score_vector_shapes_are_256": true,
+    "delta_4_ge_delta_2": true
+  },
+  "comparison": {
+    "standard_allocator_batch_8": "failed on second forward: request 7.58 GiB on GPU 0 with 6.14 GiB free and 7.93 GiB reserved but unused",
+    "standard_allocator_batch_9": "failed on second forward: request 8.53 GiB on GPU 0 with 4.43 GiB free and 9.46 GiB reserved but unused",
+    "expandable_segments_batch_10": "passed all 10 forwards / 100 rows"
+  }
+}
