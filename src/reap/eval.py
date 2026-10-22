@@ -11,9 +11,6 @@ import requests
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
-from lm_eval import evaluator
-from lm_eval.utils import make_table
-from evalplus.evaluate import evaluate as evalplus_evaluator
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.engine.arg_utils import AsyncEngineArgs
 import uvloop
@@ -157,7 +154,6 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
         str(seed),
         "--port",
         str(port),
-        "--enable-expert-parallel",
         "--max-model-len",
         str(max_model_len),
         "--max-num-seqs",
@@ -173,6 +169,10 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
         original_model_name,
         model_name,
     ]
+    if os.environ.get("REAP_VLLM_ENABLE_EXPERT_PARALLEL", "true").lower() in {
+        "1", "true", "yes"
+    }:
+        server_command.insert(9, "--enable-expert-parallel")
 
     logger.info(f"Starting VLLM OpenAI API server for {model_name} on port {port}")
     logger.info(
@@ -243,6 +243,9 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
     atexit.register(terminate_server)
 
     if eval_args.run_lm_eval:
+        from lm_eval import evaluator
+        from lm_eval.utils import make_table
+
         results_file_base_name = results_dir / "lm_eval_results"
         model_args = {
             "pretrained": model_name,
@@ -305,6 +308,8 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     try:
         if eval_args.run_evalplus:
+            from evalplus.evaluate import evaluate as evalplus_evaluator
+
             enable_thinking = True
             if "qwen" in model_name.lower() or "glm-4.5" in model_name.lower():
                 logger.info("Disabling thinking for Qwen/GLM models")

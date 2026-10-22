@@ -261,7 +261,28 @@ class LayerwiseMoEObserver:
 
     def _initialize_block_state(self, num_experts: int) -> Dict[str, Any]:
         """Initialize state dictionary for a block."""
-        return initialize_pruning_state(num_experts)
+        state = initialize_pruning_state(num_experts)
+        state["moe_residual_contribution_sum"] = torch.zeros(
+            (), dtype=torch.float64
+        )
+        state["moe_residual_contribution_count"] = torch.zeros(
+            (), dtype=torch.long
+        )
+        return state
+
+    @staticmethod
+    def _extract_moe_output(output: Any) -> torch.Tensor:
+        """Extract the combined MoE output from architecture-specific returns."""
+        if torch.is_tensor(output):
+            return output
+        if isinstance(output, (tuple, list)):
+            for value in output:
+                if torch.is_tensor(value):
+                    return value
+        raise TypeError(
+            "Could not extract a tensor MoE output for residual-contribution "
+            f"calibration; received {type(output).__name__}."
+        )
 
     def _block_at(self, block_idx: int):
         """Return the block for a valid non-negative block index, else None."""
@@ -594,6 +615,8 @@ class LayerwiseMoEObserver:
         moe_module: nn.Module,
         input_hidden_states: torch.Tensor,
         device: torch.device,
+        moe_output: torch.Tensor | None = None,
+        residual_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         batch_id: int = 0,
     ):
@@ -661,6 +684,44 @@ class LayerwiseMoEObserver:
         # Initialize state for this block if needed
         if block_idx not in self.state:
             self.state[block_idx] = self._initialize_block_state(num_experts)
+
+        if moe_output is None:
+            raise ValueError(
+                "MoE output is required for layerwise residual-contribution "
+                "calibration."
+            )
+        if moe_output.shape != input_hidden_states.shape:
+            raise ValueError(
+                f"MoE output shape {tuple(moe_output.shape)} does not match "
+                f"MoE input shape {tuple(input_hidden_states.shape)} at block "
+                f"{block_idx}."
+            )
+
+        residual_hidden_states = (
+            input_hidden_states
+            if residual_hidden_states is None
+            else residual_hidden_states
+        )
+        if residual_hidden_states.shape != input_hidden_states.shape:
+            raise ValueError(
+                f"Residual shape {tuple(residual_hidden_states.shape)} does not "
+                f"match MoE input shape {tuple(input_hidden_states.shape)} at "
+                f"block {block_idx}."
+            )
+
+        contribution = torch.linalg.vector_norm(moe_output, dim=-1) / (
+            torch.linalg.vector_norm(residual_hidden_states, dim=-1)
+            + torch.finfo(input_hidden_states.dtype).eps
+        )
+        contribution = contribution.reshape(-1)
+        if valid_token_mask is not None:
+            contribution = contribution[valid_token_mask.to(device).bool()]
+        self.state[block_idx]["moe_residual_contribution_sum"] += contribution.sum(
+            dtype=torch.float64
+        ).to("cpu")
+        self.state[block_idx]["moe_residual_contribution_count"] += torch.tensor(
+            contribution.numel(), dtype=torch.long
+        )
 
         # Compute activations for all experts
         activations = torch.zeros((num_experts, *flat_input.shape), device=device)
@@ -899,14 +960,25 @@ class LayerwiseMoEObserver:
                 return self._forward_block(block_idx)
 
         captured_moe_input: Dict[str, torch.Tensor] = {}
+        captured_residual: Dict[str, torch.Tensor] = {}
         moe_hook_handle = None
+        residual_hook_handle = None
+
+        captured_moe_output: Dict[str, torch.Tensor] = {}
 
         def _capture_moe_input_hook(module, args, output):
             captured_moe_input["input"] = args[0].detach()
+            captured_moe_output["output"] = self._extract_moe_output(output).detach()
             return output
+
+        def _capture_residual_hook(module, args):
+            if args and torch.is_tensor(args[0]):
+                captured_residual["input"] = args[0].detach()
 
         def _before_forward() -> None:
             captured_moe_input.clear()
+            captured_moe_output.clear()
+            captured_residual.clear()
 
         def _after_forward(
             target_device: torch.device,
@@ -914,22 +986,48 @@ class LayerwiseMoEObserver:
             batch_id: int,
         ) -> None:
             moe_input = captured_moe_input.get("input")
+            moe_output = captured_moe_output.get("output")
+            residual = captured_residual.get("input")
             if moe_input is None:
                 raise RuntimeError(f"Failed to capture MoE input for block {block_idx}")
+            if moe_output is None:
+                raise RuntimeError(f"Failed to capture MoE output for block {block_idx}")
 
             self._process_moe_activations(
                 block_idx,
                 moe_module,
                 moe_input,
                 target_device,
+                moe_output=moe_output,
+                residual_hidden_states=residual,
                 attention_mask=attention_mask,
                 batch_id=batch_id,
             )
 
             del moe_input
             captured_moe_input.clear()
+            captured_moe_output.clear()
+            captured_residual.clear()
 
         moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
+
+        # The residual added to the MLP output is the input to the
+        # post-attention normalization. This is distinct from the normalized
+        # tensor passed into the MoE module on pre-norm decoder blocks.
+        block = self.blocks[block_idx]
+        residual_norm = next(
+            (
+                module
+                for name, module in block.named_modules()
+                if name.rsplit(".", 1)[-1]
+                in {"post_attention_layernorm", "ffn_norm", "post_attention_norm"}
+            ),
+            None,
+        )
+        if residual_norm is not None:
+            residual_hook_handle = residual_norm.register_forward_pre_hook(
+                _capture_residual_hook
+            )
 
         try:
             return self._forward_block(
@@ -941,6 +1039,8 @@ class LayerwiseMoEObserver:
         finally:
             if moe_hook_handle is not None:
                 moe_hook_handle.remove()
+            if residual_hook_handle is not None:
+                residual_hook_handle.remove()
 
     @torch.inference_mode()
     def _record_all_blocks_for_batch_group(
@@ -1087,13 +1187,19 @@ class LayerwiseMoEObserver:
         Returns:
             State dictionary with metrics per block
         """
-        return {
+        result = {
             block_num: {
                 k: v.mean if isinstance(v, OnlineStatsTracker) else v
                 for k, v in block_state.items()
             }
             for block_num, block_state in self.state.items()
         }
+        for block_state in result.values():
+            count = block_state.get("moe_residual_contribution_count")
+            total = block_state.get("moe_residual_contribution_sum")
+            if count is not None and total is not None and int(count.item()) > 0:
+                block_state["moe_residual_contribution"] = total / count
+        return result
 
     def save_state(self, file_path: pathlib.Path):
         """Save the observer state to a file."""

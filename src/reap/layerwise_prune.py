@@ -48,7 +48,6 @@ from reap.model_util import patched_model_map
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
-from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
@@ -264,6 +263,13 @@ def main():
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
+    if prune_args.prune_method == "layerwise_seap":
+        # The strategy needs SEAP expert scores in addition to the layer-level
+        # residual contribution collected by LayerwiseMoEObserver.
+        obs_args.collect_seap = True
+        if obs_args.seap_output_dir is None:
+            obs_args.seap_output_dir = str(results_dir / "seap")
+
     # Get patched model name if needed
     model_name = patched_model_map(model_args.model_name)
 
@@ -334,17 +340,28 @@ def main():
             raise ValueError(
                 "Either n_experts_to_prune or compression_ratio must be set."
             )
-        total_experts = len(
-            observer_data[next(iter(observer_data))]["expert_frequency"]
-        )
+        if prune_args.prune_method == "layerwise_seap":
+            total_experts = sum(
+                state["expert_frequency"].shape[0]
+                for state in observer_data.values()
+            )
+        else:
+            total_experts = len(
+                observer_data[next(iter(observer_data))]["expert_frequency"]
+            )
         n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
         logger.info(
             f"Calculated n_experts_to_prune: {n_experts_to_prune} "
             f"(compression_ratio: {cluster_args.compression_ratio})"
         )
     else:
-        total_experts = len(
-            observer_data[next(iter(observer_data))]["expert_frequency"]
+        total_experts = (
+            sum(
+                state["expert_frequency"].shape[0]
+                for state in observer_data.values()
+            )
+            if prune_args.prune_method == "layerwise_seap"
+            else len(observer_data[next(iter(observer_data))]["expert_frequency"])
         )
 
     # Get output directory
@@ -412,6 +429,8 @@ def main():
 
     # Evaluation
     if reap_args.do_eval:
+        from reap.eval import run_evaluate
+
         logger.info("Starting evaluation...")
         if model is not None:
             del model

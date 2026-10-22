@@ -16,7 +16,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from accelerate.hooks import remove_hook_from_module
 
 from reap.args import ClusterArgs, DatasetArgs, EvalArgs, ModelArgs, ObserverArgs, PruneArgs, ReapArgs
-from reap.eval import run_evaluate
 from reap.main import dump_args_to_yaml, smoke_test
 from reap.prune import prune
 
@@ -27,7 +26,7 @@ def parse_args():
     parser.add_argument("--state-path", required=True)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     parser.add_argument("--compression-ratio", type=float, default=0.25)
-    parser.add_argument("--prune-method", choices=("seap", "reap"), default="seap")
+    parser.add_argument("--prune-method", choices=("seap", "layerwise_seap", "reap"), default="seap")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-smoke-test", action="store_true")
     parser.add_argument("--run-eval", action="store_true")
@@ -74,6 +73,8 @@ def main():
     if args.evaluate_only:
         if args.checkpoint_dir is None:
             raise ValueError("--checkpoint-dir is required with --evaluate-only")
+        from reap.eval import run_evaluate
+
         venv_bin = str(pathlib.Path(sys.executable).parent)
         os.environ["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
         eval_args = EvalArgs(
@@ -108,9 +109,12 @@ def main():
     score_key = "seap_score" if args.prune_method == "seap" else "reap_score"
     if score_key not in first_layer:
         raise KeyError(f"State is missing {score_key}, required for {args.prune_method} pruning")
-    total_experts = int(first_layer[score_key].shape[0])
+    experts_per_layer = int(first_layer[score_key].shape[0])
+    total_layers = len(state)
+    total_experts = experts_per_layer * total_layers if args.prune_method == "layerwise_seap" else experts_per_layer
     n_experts_to_prune = int(total_experts * args.compression_ratio)
-    if not 0 <= n_experts_to_prune < total_experts:
+    maximum_prunable = total_experts - total_layers if args.prune_method == "layerwise_seap" else total_experts - 1
+    if not 0 <= n_experts_to_prune <= maximum_prunable:
         raise ValueError("compression ratio must prune at least 0 and fewer than all experts")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, local_files_only=True)

@@ -16,7 +16,6 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
 from reap.args import (
     ReapArgs,
     ModelArgs,
@@ -33,11 +32,97 @@ from reap.cluster import (
     dynamic_frequency_penalized_clustering,
 )
 from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
-from reap.eval import run_evaluate
 import shutil
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def allocate_layerwise_pruning_counts(
+    observer_data: dict[int, dict[str, Any]],
+    total_experts_to_prune: int,
+    *,
+    epsilon: float = 1e-12,
+) -> dict[int, int]:
+    """Allocate a global pruning budget using inverse MoE contribution.
+
+    Lower-contribution layers receive a larger pruning fraction. Allocation is
+    deterministic, respects the one-expert-per-layer lower bound, and returns
+    integer counts summing exactly to ``total_experts_to_prune``.
+    """
+    layers = list(observer_data)
+    if not layers:
+        return {}
+
+    sizes = {
+        layer: int(observer_data[layer]["expert_frequency"].shape[0])
+        for layer in layers
+    }
+    maximum = sum(max(size - 1, 0) for size in sizes.values())
+    if not 0 <= total_experts_to_prune <= maximum:
+        raise ValueError(
+            f"Requested {total_experts_to_prune} expert removals, but the valid "
+            f"range is [0, {maximum}] while retaining at least one expert per layer."
+        )
+
+    priorities = {}
+    for layer in layers:
+        contribution = observer_data[layer].get("moe_residual_contribution")
+        if contribution is None:
+            raise ValueError(
+                "layerwise_seap requires 'moe_residual_contribution' for every "
+                f"MoE layer; missing layer {layer}."
+            )
+        value = float(torch.as_tensor(contribution).item())
+        if not torch.isfinite(torch.tensor(value)) or value < 0:
+            raise ValueError(
+                f"Invalid MoE residual contribution for layer {layer}: {value}"
+            )
+        priorities[layer] = 1.0 / max(value, epsilon)
+
+    counts = {layer: 0 for layer in layers}
+    remaining = total_experts_to_prune
+    active = [layer for layer in layers if sizes[layer] > 1]
+
+    # Water-fill capped layers first, then use largest remainder allocation.
+    while remaining and active:
+        denominator = sum(sizes[layer] * priorities[layer] for layer in active)
+        raw = {
+            layer: remaining * sizes[layer] * priorities[layer] / denominator
+            for layer in active
+        }
+        capped = [
+            layer for layer in active if raw[layer] >= sizes[layer] - 1
+        ]
+        if capped:
+            for layer in capped:
+                cap = sizes[layer] - 1
+                counts[layer] = cap
+                remaining -= cap
+                active.remove(layer)
+            continue
+
+        floors = {layer: min(int(raw[layer]), sizes[layer] - 1) for layer in active}
+        for layer, count in floors.items():
+            counts[layer] += count
+        remaining -= sum(floors.values())
+        if remaining:
+            ranked = sorted(
+                active,
+                key=lambda layer: (raw[layer] - floors[layer], -layers.index(layer)),
+                reverse=True,
+            )
+            for layer in ranked:
+                if not remaining:
+                    break
+                if counts[layer] < sizes[layer] - 1:
+                    counts[layer] += 1
+                    remaining -= 1
+        break
+
+    if remaining:
+        raise RuntimeError("Failed to allocate the complete layerwise pruning budget")
+    return counts
 
 
 def prune(
@@ -81,20 +166,36 @@ def prune(
                     if metric in observer_data[layer]:
                         observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
+    layer_pruning_counts = None
+    if prune_args.prune_method == "layerwise_seap":
+        layer_pruning_counts = allocate_layerwise_pruning_counts(
+            observer_data, n_experts_to_prune
+        )
+
+    retained_counts = {}
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
+        layer_n_experts_to_prune = (
+            layer_pruning_counts[layer]
+            if layer_pruning_counts is not None
+            else n_experts_to_prune
+        )
         if prune_args.prune_method == "ean_ca":
             ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
             for i in range(num_experts):
                 ean[i] = torch.linalg.norm(
                     observer_data[layer]["routed_characteristic_activation"][i], dim=-1
                 ).sum()
-            _, experts_to_prune = torch.topk(ean, n_experts_to_prune, largest=False)
+            _, experts_to_prune = torch.topk(
+                ean, layer_n_experts_to_prune, largest=False
+            )
         else:
             prune_method = prune_args.prune_method
             if prune_method == "frequency":
                 prune_method = "expert_frequency"
             elif prune_method == "seap":
+                prune_method = "seap_score"
+            elif prune_method == "layerwise_seap":
                 prune_method = "seap_score"
             saliency_data = observer_data[layer].get(prune_method)
             if saliency_data is None:
@@ -103,12 +204,13 @@ def prune(
                     f"Available keys: {list(observer_data[layer].keys())}"
                 )
             _, experts_to_prune = torch.topk(
-                saliency_data, n_experts_to_prune, largest=False
+                saliency_data, layer_n_experts_to_prune, largest=False
             )
 
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
+        retained_counts[layer] = len(retained_expert_indicies)
         # prune experts
         moe = get_moe(model, layer)
         if not model_attrs["fused"]:
@@ -156,6 +258,15 @@ def prune(
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     setattr(model.config, model_attrs["num_experts"], retained_experts)
+    if model.__class__.__name__ == "Glm4MoeForCausalLM":
+        # GLM's current Transformers/vLLM implementations normally assume one
+        # routed-expert count globally. Preserve the actual per-layer counts so
+        # a compatible runtime can construct non-uniform MoE layers.
+        num_layers = int(getattr(model.config, "num_hidden_layers", 0))
+        model.config.layer_n_routed_experts = [
+            retained_counts.get(layer, None) for layer in range(num_layers)
+        ]
+        model.config.n_routed_experts = max(retained_counts.values())
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
@@ -203,6 +314,14 @@ def get_pruned_model_dir(
 
 
 def main():
+    from reap.main import (
+        record_activations,
+        smoke_test,
+        create_results_directory,
+        dump_args_to_yaml,
+    )
+    from reap.eval import run_evaluate
+
     parser = HfArgumentParser(
         (
             ReapArgs,
@@ -255,6 +374,16 @@ def main():
 
     # pruning
     logger.info("Start of pruning")
+    layer_expert_counts = {
+        layer: len(data["expert_frequency"])
+        for layer, data in observer_data.items()
+    }
+    if prune_args.prune_method == "layerwise_seap":
+        # The compression ratio is global across all MoE layers.  For GLM-4.5-Air,
+        # 0.5 therefore means removing 50% of the 45 * 128 experts, not 64 total.
+        total_experts = sum(layer_expert_counts.values())
+    else:
+        total_experts = next(iter(layer_expert_counts.values()))
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
@@ -263,9 +392,6 @@ def main():
             )
         else:
             # Calculate n_experts_to_prune from compression_ratio
-            total_experts = len(
-                observer_data[next(iter(observer_data))]["expert_frequency"]
-            )
             n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
             logger.info(
                 f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"

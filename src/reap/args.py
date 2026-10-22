@@ -533,6 +533,7 @@ class PruneArgs:
                 "reap",
                 "reap_l2",
                 "seap",
+                "layerwise_seap",
                 "max_activations"
             ]
         },

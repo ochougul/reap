@@ -33,16 +33,19 @@ def _glm_route(router: torch.nn.Module, hidden_states: torch.Tensor) -> tuple[to
     correction = router.e_score_correction_bias.float().unsqueeze(0)
     corrected = scores + correction
 
-    experts_per_group = router.n_routed_experts // router.n_group
-    grouped = corrected.view(-1, router.n_group, experts_per_group)
+    n_routed_experts = getattr(router, "n_routed_experts", router.num_experts)
+    n_group = getattr(router, "n_group", router.num_group)
+    topk_group = getattr(router, "topk_group")
+    experts_per_group = n_routed_experts // n_group
+    grouped = corrected.view(-1, n_group, experts_per_group)
     group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
-    group_idx = group_scores.topk(router.topk_group, dim=-1, sorted=False).indices
+    group_idx = group_scores.topk(topk_group, dim=-1, sorted=False).indices
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
     eligible = (
         group_mask.unsqueeze(-1)
-        .expand(-1, router.n_group, experts_per_group)
-        .reshape(-1, router.n_routed_experts)
+        .expand(-1, n_group, experts_per_group)
+        .reshape(-1, n_routed_experts)
         .bool()
     )
     ranking_values = corrected.masked_fill(~eligible, -torch.inf)
@@ -50,7 +53,9 @@ def _glm_route(router: torch.nn.Module, hidden_states: torch.Tensor) -> tuple[to
 
 
 def _route_once(router: torch.nn.Module, hidden_states: torch.Tensor, top_k: int, boundary: int):
-    if hasattr(router, "e_score_correction_bias") and hasattr(router, "n_group"):
+    if hasattr(router, "e_score_correction_bias") and (
+        hasattr(router, "n_group") or hasattr(router, "num_group")
+    ):
         logits, scores, ranking_values = _glm_route(router, hidden_states)
     else:
         result = router(hidden_states)
