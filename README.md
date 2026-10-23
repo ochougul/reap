@@ -136,6 +136,44 @@ calibrate on a different dataset, construct arbitrary `lambda`/`delta` score
 states offline, prune with either SEAP or REAP, and evaluate on selected
 lm-eval, EvalPlus, or LiveCodeBench tasks.
 
+#### Reproducible evaluation settings
+
+LiveCodeBench uses sampling by default in its upstream runner. For robust
+comparisons between pruning methods, always make the generation settings
+explicit and use the deterministic profile:
+
+```bash
+--livecodebench-temperature 0.0 \
+--livecodebench-top-p 1.0 \
+--livecodebench-seed 42
+```
+
+The temperature and request-level seed are passed through to the vLLM OpenAI
+request. The vLLM server itself should also use the same `--seed` (the
+evaluation helper does this automatically). Temperature 0 removes sampling
+variance; the fixed request seed protects against any remaining stochastic
+sampling paths. Keep the model checkpoint, Transformers/vLLM versions, GPU
+count, tensor/expert-parallel settings, LiveCodeBench date range, and prompt
+settings fixed as well. GPU kernels and parallel scheduling can still cause
+minor implementation-level differences, so report the exact command and
+environment with each result.
+
+Example:
+
+```bash
+uv run python experiments/prune_seap_state.py \
+  --model-path /path/to/model \
+  --state-path /path/to/lambda-state.pt \
+  --output-dir artifacts/eval/reproducible-run \
+  --compression-ratio 0.25 \
+  --prune-method seap \
+  --run-eval --no-run-lm-eval --no-run-evalplus \
+  --run-livecodebench --no-run-wildbench --no-run-math \
+  --livecodebench-temperature 0.0 \
+  --livecodebench-top-p 1.0 \
+  --livecodebench-seed 42
+```
+
 For every routing event, the collector records the eight selected experts plus
 the next four boundary experts. It records correction-adjusted ranking values
 for all twelve experts and the final normalized/scaled applied weights for the

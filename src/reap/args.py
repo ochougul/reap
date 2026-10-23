@@ -505,6 +505,20 @@ class EvalArgs:
             "help": "Number of parallel tasks to run during evalplus evaluation."
         },
     )
+    livecodebench_temperature: float = field(
+        default=0.0,
+        metadata={
+            "help": "LiveCodeBench sampling temperature; 0.0 is recommended for reproducible comparisons."
+        },
+    )
+    livecodebench_top_p: float = field(
+        default=1.0,
+        metadata={"help": "LiveCodeBench top-p value."},
+    )
+    livecodebench_seed: int | None = field(
+        default=42,
+        metadata={"help": "Per-request LiveCodeBench seed; use a fixed value for comparisons."},
+    )
     eval_limit: int | None = field(
         default=None,
         metadata={"help": "Limit evaluation examples for smoke tests."},

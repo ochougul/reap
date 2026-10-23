@@ -40,6 +40,9 @@ def parse_args():
     parser.add_argument("--lm-eval-tasks", nargs="+", default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--evalplus-tasks", nargs="+", default=None)
+    parser.add_argument("--livecodebench-temperature", type=float, default=0.0)
+    parser.add_argument("--livecodebench-top-p", type=float, default=1.0)
+    parser.add_argument("--livecodebench-seed", type=int, default=42)
     parser.add_argument("--vllm-port", type=int, default=8000)
     parser.add_argument("--server-log-file-name", default="seap-eval-server.log")
     parser.add_argument("--evaluate-only", action="store_true", help=argparse.SUPPRESS)
@@ -89,6 +92,9 @@ def main():
             vllm_port=args.vllm_port,
             server_log_file_name=args.server_log_file_name,
             eval_limit=args.eval_limit,
+            livecodebench_temperature=args.livecodebench_temperature,
+            livecodebench_top_p=args.livecodebench_top_p,
+            livecodebench_seed=args.livecodebench_seed,
         )
         run_evaluate(ModelArgs(model_name=str(args.checkpoint_dir)), args.output_dir / "eval", eval_args, args.seed)
         return
@@ -165,6 +171,9 @@ def main():
             vllm_port=args.vllm_port,
             server_log_file_name=args.server_log_file_name,
             eval_limit=args.eval_limit,
+            livecodebench_temperature=args.livecodebench_temperature,
+            livecodebench_top_p=args.livecodebench_top_p,
+            livecodebench_seed=args.livecodebench_seed,
         ),
         prune_args=prune_args,
         cluster_args=ClusterArgs(compression_ratio=args.compression_ratio),

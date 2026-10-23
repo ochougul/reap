@@ -22,6 +22,29 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
+def _set_livecodebench_request_seed(seed):
+    """Inject a fixed seed into LiveCodeBench's vLLM OpenAI requests.
+
+    LiveCodeBench is kept as a git submodule and its upstream runner does not
+    expose the OpenAI ``seed`` request field. Patch the local runner class at
+    runtime so reproducibility controls remain in REAP rather than requiring
+    an unpublished submodule commit.
+    """
+    from lcb_runner.runner import vllm_server_runner
+
+    if getattr(vllm_server_runner.VLLMServerRunner, "_reap_seed_patch", False):
+        return
+    original_init = vllm_server_runner.VLLMServerRunner.__init__
+
+    def init_with_seed(self, args, model):
+        original_init(self, args, model)
+        if seed is not None:
+            self.client_kwargs["seed"] = seed
+
+    vllm_server_runner.VLLMServerRunner.__init__ = init_with_seed
+    vllm_server_runner.VLLMServerRunner._reap_seed_patch = True
+
+
 def get_original_model_name(model_name: str) -> Tuple[str, bool]:
     original_model_name_map = {
         "Mixtral-8x7B-Instruct-v0.1": "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -361,6 +384,8 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
             from lcb_runner.runner.main import main as lcb_main
             from lcb_runner.runner.main import get_args_dict
 
+            _set_livecodebench_request_seed(eval_args.livecodebench_seed)
+
             original_model, uncompressed_model = get_original_model_name(model_name)
 
             lcb_args = get_args_dict(
@@ -375,6 +400,9 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 timeout=120,
                 local_model_path=model_name if not uncompressed_model else None,
                 max_tokens=16384,
+                temperature=eval_args.livecodebench_temperature,
+                top_p=eval_args.livecodebench_top_p,
+                seed=eval_args.livecodebench_seed,
             )
             logger.info(f"Running LiveCodeBench with args: {lcb_args}")
             lcb_main(lcb_args)
