@@ -806,17 +806,13 @@ def main():
             merge_args,
         )
 
-        if model_name == "artifacts/models/GLM-4.5-Air":
-            # move modelling file
-            source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"
-            target_file = merged_model_dir / "modeling_glm4_moe.py"
-            if source_file.exists():
-                shutil.copy2(source_file, target_file)
-                logger.info(f"Copied modeling_glm4_moe.py to {merged_model_dir}")
-            else:
-                raise RuntimeError(
-                    f"Source file {source_file} does not exist. Cannot copy to {target_file}."
-                )
+        # Preserve local custom modeling files for any remote-code checkpoint;
+        # this is not specific to GLM-4.5-Air.
+        source_files = list(pathlib.Path(model_name).glob("modeling_*.py"))
+        for source_file in source_files:
+            target_file = merged_model_dir / source_file.name
+            shutil.copy2(source_file, target_file)
+            logger.info("Copied %s to %s", source_file.name, merged_model_dir)
 
     # eval
     if reap_args.do_eval:

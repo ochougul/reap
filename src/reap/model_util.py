@@ -6,6 +6,30 @@ logger = logging.getLogger(__name__)
 
 
 MODEL_ATTRS = {
+    "Qwen4ExpForConditionalGeneration": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
+    # Transformers 5.x exposes the same packed-expert checkpoint as a causal
+    # LM class when loaded through the local evaluation environment.
+    "Qwen4ExpForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_up_proj",
+        "up_proj": "gate_up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": True,
+        "router": "gate",
+        "num_experts": "num_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
     "Qwen3MoeForCausalLM": {
         "moe_block": "mlp",
         "gate_proj": "gate_proj",
@@ -117,6 +141,61 @@ MODEL_ATTRS = {
         "num_experts_per_tok": "num_experts_per_tok",
     },
 }
+
+
+def _slice_expert_parameter(module, name: str, retained_indices: list[int]) -> bool:
+    """Slice an expert-axis parameter or buffer if it exists.
+
+    FP8 Transformers modules keep the inverse quantization scales as sibling
+    tensors (for example ``down_proj_scale_inv``).  They are part of the
+    expert representation and must be reindexed with the corresponding
+    weights.  The helper intentionally operates on ``.data`` so it supports
+    both Parameters and registered buffers without changing their types.
+    """
+    value = getattr(module, name, None)
+    if value is None:
+        return False
+    if not hasattr(value, "data") or value.data.ndim == 0:
+        raise ValueError(f"Expected expert tensor for {name}, got {type(value)!r}")
+    if value.data.shape[0] <= max(retained_indices, default=-1):
+        raise ValueError(
+            f"{name} has expert dimension {value.data.shape[0]}, but retained "
+            f"indices include {max(retained_indices, default=-1)}"
+        )
+    value.data = value.data[retained_indices].clone()
+    return True
+
+
+def slice_fused_expert_weights(experts, retained_indices: list[int]) -> None:
+    """Prune packed/fused expert weights and all matching FP8 scale tensors.
+
+    Qwen4ExpTextExperts exposes ``gate_up_proj`` and ``down_proj``.  Older
+    fused implementations (such as Llama 4) expose the same two weights.
+    Depending on the Transformers/quantization loader, scales may be named
+    ``<weight>_scale_inv`` or may remain split as ``gate_proj`` and
+    ``up_proj`` companions.  Slice every representation that is present.
+    """
+    retained_indices = list(retained_indices)
+    weight_names = ("gate_up_proj", "down_proj")
+    for weight_name in weight_names:
+        if not _slice_expert_parameter(experts, weight_name, retained_indices):
+            raise AttributeError(
+                f"Fused expert module {type(experts).__name__} is missing "
+                f"{weight_name}"
+            )
+        _slice_expert_parameter(
+            experts, f"{weight_name}_scale_inv", retained_indices
+        )
+
+    # Some FP8 loaders retain the original split scale names after packing.
+    # They are still expert-indexed and must follow the same permutation.
+    for split_name in ("gate_proj", "up_proj"):
+        _slice_expert_parameter(
+            experts, f"{split_name}_scale_inv", retained_indices
+        )
+
+    if hasattr(experts, "num_experts"):
+        experts.num_experts = len(retained_indices)
 
 
 def get_moe(model, layer):

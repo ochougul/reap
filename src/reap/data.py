@@ -27,7 +27,14 @@ import logging
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
-from vllm import TokensPrompt
+try:
+    from vllm import TokensPrompt
+except ImportError:
+    class TokensPrompt(dict):
+        """Small compatibility fallback for dataset-only calibration runs."""
+
+        def __init__(self, *, prompt_token_ids):
+            super().__init__(prompt_token_ids=prompt_token_ids)
 
 
 logger = logging.getLogger(__name__)
@@ -236,6 +243,7 @@ def load_category_batches(
     return_vllm_tokens_prompt,
     truncate,
     batches_per_category,
+    pack_samples=True,
 ):
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
@@ -252,6 +260,7 @@ def load_category_batches(
         dataset=raw_ds,
         tokenizer=tokenizer,
         max_input_len=model_max_length,
+        pack_samples=pack_samples,
         split=split,
         split_by_category=split_by_category,
         return_vllm_tokens_prompt=return_vllm_tokens_prompt,
@@ -558,6 +567,11 @@ class BaseDatasetProcessor(ABC):
                 sampled.append(sample_idx)
                 sample = category_dataset[sample_idx]
                 encoded_sample = self._encode_sample(sample)  # shape (batch, seq)
+                # Match the unpacked GLM calibration semantics when
+                # truncate=False: an overlong source row is filtered rather
+                # than contributing a truncated prefix to a packed sequence.
+                if encoded_sample.shape[-1] > self.max_input_len and not self.truncate:
+                    continue
                 end_seq = seq_idx + encoded_sample.shape[-1]
                 if end_seq > self.max_input_len:
                     encoded_sample = encoded_sample[:, : (self.max_input_len - seq_idx)]

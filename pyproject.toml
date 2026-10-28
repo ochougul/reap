@@ -17,9 +17,14 @@ dependencies = [
     "pyarrow>=11.0.0",
     "python-dotenv>=1.1.0",
     "seaborn>=0.13.2",
-    "torch==2.7.1",
-    # "transformers==4.53.3",  # latest version working for ernie.
-    "transformers==4.55.0",
+    # Native FP8/EP kernels require the torch-2.10 CUDA 12.8 build.
+    "torch>=2.10.0,<2.11.0",
+    "tqdm>=4.67.0",
+    "transformers>=5.8.0",
+    "kernels==0.17.2",
+    "triton==3.6.0",
+    "flash-linear-attention>=0.5.2",
+    "causal-conv1d>=1.7.0",
     "umap-learn>=0.5.7",
     "vllm==0.10.0",
     "livecodebench",

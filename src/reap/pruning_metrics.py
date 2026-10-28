@@ -247,6 +247,7 @@ def update_pruning_state_from_routed_outputs(
     router_logits: torch.Tensor,
     num_experts: int,
     renormalize_router_weights: bool = False,
+    accumulate_routing_stats: bool = True,
 ) -> None:
     """Accumulate metrics from the model's already-computed routed outputs.
 
@@ -265,13 +266,14 @@ def update_pruning_state_from_routed_outputs(
         raise ValueError("Router logits and selected experts must have matching tokens")
 
     frequencies = torch.bincount(selected_experts.reshape(-1), minlength=num_experts)
-    layer_state["total_tokens"] += torch.tensor(
-        selected_experts.shape[0], device="cpu", dtype=torch.long
-    )
-    layer_state["expert_frequency"] += frequencies.cpu()
-    layer_state["pairwise_expert_frequency"] += (
-        frequencies.unsqueeze(0) + frequencies.unsqueeze(1)
-    ).cpu()
+    if accumulate_routing_stats:
+        layer_state["total_tokens"] += torch.tensor(
+            selected_experts.shape[0], device="cpu", dtype=torch.long
+        )
+        layer_state["expert_frequency"] += frequencies.cpu()
+        layer_state["pairwise_expert_frequency"] += (
+            frequencies.unsqueeze(0) + frequencies.unsqueeze(1)
+        ).cpu()
 
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
     if renormalize_router_weights and selected_experts.numel() > 0:
@@ -281,27 +283,39 @@ def update_pruning_state_from_routed_outputs(
             routing_weights, min=torch.finfo(routing_weights.dtype).eps
         )
 
-    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
-    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
-    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
-    reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
-    weighted_frequency = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    # The routed output is already flattened to one row per token/expert pair.
+    # Aggregate all expert metrics in one vectorized pass.  The previous
+    # implementation entered Python once per active expert, repeatedly masked
+    # GPU tensors, and copied one maximum to CPU per expert.  With 512 experts
+    # this made the callback a significant part of calibration time.
     metric_frequency = torch.bincount(expert_ids, minlength=num_experts)
+    norms = torch.linalg.vector_norm(expert_outputs, dim=-1)
+    weights = routing_weights[token_indices, expert_ids]
+    weighted_norms = norms * weights
 
-    for expert_id in torch.unique(expert_ids).tolist():
-        rows = expert_ids == expert_id
-        activations = expert_outputs[rows]
-        token_ids = token_indices[rows]
-        norms = torch.linalg.vector_norm(activations, dim=-1)
-        weights = routing_weights[token_ids, expert_id]
-        ean_sum[expert_id] = norms.sum()
-        ean_mean[expert_id] = norms.mean()
-        weighted_frequency[expert_id] = weights.sum()
-        weighted_ean_sum[expert_id] = (norms * weights).sum()
-        reap[expert_id] = (norms * weights).mean()
-        max_activation = activations.max().to(device="cpu")
-        if max_activation > layer_state["max_activations"][expert_id]:
-            layer_state["max_activations"][expert_id] = max_activation
+    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    ean_sum.scatter_add_(0, expert_ids, norms.to(torch.float64))
+    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    weighted_ean_sum.scatter_add_(0, expert_ids, weighted_norms.to(torch.float64))
+    weighted_frequency = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    weighted_frequency.scatter_add_(0, expert_ids, weights.to(torch.float64))
+
+    counts = metric_frequency.to(torch.float32)
+    ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
+    nonzero = counts > 0
+    ean_mean[nonzero] = (ean_sum.float()[nonzero] / counts[nonzero])
+    reap[nonzero] = (weighted_ean_sum.float()[nonzero] / counts[nonzero])
+
+    row_max = expert_outputs.max(dim=-1).values
+    max_activation = torch.full(
+        (num_experts,), -torch.inf, device=device, dtype=row_max.dtype
+    )
+    max_activation.scatter_reduce_(0, expert_ids, row_max, reduce="amax", include_self=True)
+    max_activation = max_activation.cpu()
+    previous_max = layer_state["max_activations"]
+    finite = torch.isfinite(max_activation)
+    previous_max[finite] = torch.maximum(previous_max[finite], max_activation[finite])
 
     layer_state["ean_sum"] += ean_sum.cpu()
     layer_state["ean_mean"].update(ean_mean.cpu(), metric_frequency.cpu())

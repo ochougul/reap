@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from reap.router_stability import _glm_route, _route_once
+from reap.router_stability import _grouped_router_route, _route_once
 
 
 @dataclass
@@ -45,7 +45,7 @@ def collect_seap_observation(
     hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     original = _route_once(router, hidden_states, top_k, boundary=0)
     if hasattr(router, "e_score_correction_bias") and hasattr(router, "n_group"):
-        _, _, original_ranking = _glm_route(router, hidden_states)
+        _, _, original_ranking = _grouped_router_route(router, hidden_states)
     else:
         original_ranking = original[0]
     original_ranks, _ = _rank_map(original_ranking)
@@ -60,7 +60,7 @@ def collect_seap_observation(
     perturbed_hidden = hidden_states + noise.to(hidden_states.dtype)
     perturbed = _route_once(router, perturbed_hidden, top_k, boundary=0)
     if hasattr(router, "e_score_correction_bias") and hasattr(router, "n_group"):
-        _, _, perturbed_ranking = _glm_route(router, perturbed_hidden)
+        _, _, perturbed_ranking = _grouped_router_route(router, perturbed_hidden)
     else:
         perturbed_ranking = perturbed[0]
     perturbed_ranks, perturbed_eligible = _rank_map(perturbed_ranking)
@@ -79,7 +79,10 @@ def collect_seap_observation(
 
 
 def ranking_values_num_experts(router: torch.nn.Module) -> int:
-    return int(getattr(router, "n_routed_experts", router.weight.shape[0])) + 1
+    value = getattr(router, "n_routed_experts", None)
+    if value is None:
+        value = getattr(router, "num_experts", router.weight.shape[0])
+    return int(value) + 1
 
 
 class SeapCollector:

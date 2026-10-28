@@ -6,6 +6,7 @@ import os
 import json
 import shutil
 import subprocess
+import sys
 import time
 import requests
 
@@ -14,6 +15,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.engine.arg_utils import AsyncEngineArgs
 import uvloop
+
+# LiveCodeBench is vendored as a repository submodule rather than installed
+# into every evaluation environment.
+_LCB_ROOT = pathlib.Path(__file__).resolve().parents[2] / "third-party" / "LiveCodeBench"
+if str(_LCB_ROOT) not in sys.path:
+    sys.path.insert(0, str(_LCB_ROOT))
 
 from reap.args import ReapArgs, ModelArgs, EvalArgs
 from reap.model_util import patched_model_map, MODEL_ATTRS
@@ -30,6 +37,11 @@ def _set_livecodebench_request_seed(seed):
     runtime so reproducibility controls remain in REAP rather than requiring
     an unpublished submodule commit.
     """
+    # LiveCodeBench is vendored as a repository submodule rather than
+    # installed into every evaluation environment.
+    lcb_root = pathlib.Path(__file__).resolve().parents[2] / "third-party" / "LiveCodeBench"
+    if str(lcb_root) not in sys.path:
+        sys.path.insert(0, str(lcb_root))
     from lcb_runner.runner import vllm_server_runner
 
     if getattr(vllm_server_runner.VLLMServerRunner, "_reap_seed_patch", False):
@@ -58,6 +70,11 @@ def get_original_model_name(model_name: str) -> Tuple[str, bool]:
         "gpt-oss-120b": "openai/gpt-oss-120b",
         "GLM-4.5-Air": "zai-org/GLM-4.5-Air",
         "Qwen3-Coder-480B-A35B-Instruct-FP8": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        # Qwen3.8-Flash-Next is registered by Transformers as the qwen4_exp
+        # architecture.  Keep its public model id here so LiveCodeBench uses
+        # the model-specific prompt/style even when evaluating a local pruned
+        # checkpoint whose path no longer contains the original repo id.
+        "Qwen3.8-Flash-Next-FP8": "Qwen/Qwen3.8-Flash-Next-FP8",
     }
 
     original_model = None
@@ -146,7 +163,10 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
     override_generation_config_str = json.dumps(override_generation_config)
 
     hf_overrides = {}
-    max_num_seqs = 32
+    # H100 memory profiling on Qwen3.8-Flash-Next-FP8 leaves enough headroom
+    # for 64 concurrent requests.  Keep the token cap at max_model_len: the
+    # KV cache, rather than request count, is the limiting resource here.
+    max_num_seqs = 64
     max_model_len = 32768
     gpu_memory_utilization = 0.90
     if model_args.num_experts_per_tok_override is not None:
@@ -166,7 +186,10 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
     # in place of patching vllm.model_executor.models.registry for Llama4.
 
     server_command = [
-        "vllm",
+        # Use the vLLM entry point beside the interpreter running REAP so a
+        # separate evaluation venv is honored even when the host has another
+        # (or no) vLLM installation.
+        str(pathlib.Path(sys.executable).with_name("vllm")),
         "serve",
         model_name,
         "--gpu-memory-utilization",
@@ -394,15 +417,15 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
                 output_path=results_dir,
                 enable_thinking=False,
                 base_url=f"{server_endpoint}/v1",
+                # Match the paper's controlled LiveCodeBench snapshot.
                 start_date="2025-01-01",
-                end_date="2025-07-31",
+                end_date="2025-04-30",
                 evaluate=True,
                 timeout=120,
                 local_model_path=model_name if not uncompressed_model else None,
                 max_tokens=16384,
                 temperature=eval_args.livecodebench_temperature,
                 top_p=eval_args.livecodebench_top_p,
-                seed=eval_args.livecodebench_seed,
             )
             logger.info(f"Running LiveCodeBench with args: {lcb_args}")
             lcb_main(lcb_args)

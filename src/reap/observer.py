@@ -494,6 +494,21 @@ class MoETransformerObserver(BaseTransformerObserver):
 @dataclass
 class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "Qwen3MoeSparseMoeBlock"
+    num_experts_attr_name: str = "config.num_experts"
+    top_k_attr_name: str = "config.num_experts_per_tok"
+
+
+@dataclass
+class Qwen4ExpMoEObserverHookConfig(MoETransformerObserverConfig):
+    """Metadata for Qwen4's packed language-model experts.
+
+    The production Qwen4 path uses the callback runner because its packed
+    dispatcher does not expose a ModuleList of iterable experts.
+    """
+
+    module_class_name_to_hook_regex: Optional[str] = "Qwen4Exp.*SparseMoeBlock"
+    num_experts_attr_name: str = "config.num_experts"
+    top_k_attr_name: str = "config.num_experts_per_tok"
 
 
 @dataclass
@@ -537,6 +552,8 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
 
 
 OBSERVER_CONFIG_REGISTRY = {
+    "Qwen4ExpForConditionalGeneration": Qwen4ExpMoEObserverHookConfig,
+    "Qwen4ExpForCausalLM": Qwen4ExpMoEObserverHookConfig,
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,

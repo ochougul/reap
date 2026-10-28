@@ -28,10 +28,18 @@ for delta in args.deltas:
             stability = values.get(delta_key)
             if stability is None:
                 all_stability = values.get("stability_scores")
-                if all_stability is None:
+                if all_stability is not None:
+                    stability = all_stability[0 if delta == 2.0 else 1]
+                elif delta == 2.0 and values.get("stability_score") is not None:
+                    # Older saved states contain only the selected delta's score.
+                    stability = values["stability_score"]
+                else:
                     raise KeyError(f"Missing {delta_key} in layer {layer}")
-                stability = all_stability[0 if delta == 2.0 else 1]
-            normalized_reap = values["normalized_reap"].float()
+            normalized_reap = values.get("normalized_reap")
+            if normalized_reap is None:
+                reap = values.get("reap_score", values["reap"]).float()
+                normalized_reap = reap / reap.max() if reap.numel() and reap.max() > 0 else torch.zeros_like(reap)
+            normalized_reap = normalized_reap.float()
             values["stability_score"] = stability.float()
             values["seap_score"] = (
                 lambda_ * normalized_reap + (1.0 - lambda_) * stability.float()

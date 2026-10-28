@@ -31,7 +31,14 @@ from reap.cluster import (
     hierarchical_clustering,
     dynamic_frequency_penalized_clustering,
 )
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import (
+    get_moe,
+    assert_merge,
+    MODEL_ATTRS,
+    patched_model_map,
+    get_super_expert_indices,
+    slice_fused_expert_weights,
+)
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -213,7 +220,15 @@ def prune(
         retained_counts[layer] = len(retained_expert_indicies)
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+        # Some Qwen4/FP8 loaders advertise a fused expert implementation but
+        # materialize ``experts`` as a ModuleList of individual experts. The
+        # branch must follow the object that will be serialized; otherwise we
+        # only shrink the config/router while all original expert modules
+        # remain in the checkpoint.
+        is_fused_experts = model_attrs["fused"] and hasattr(
+            getattr(moe, model_attrs["experts"]), "gate_up_proj"
+        )
+        if not is_fused_experts:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -243,21 +258,37 @@ def prune(
                 moe.num_experts = len(retained_expert_indicies)
             setattr(moe, model_attrs["router"], router)
         else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
+            # Prune packed expert tensors.  This covers Llama-4 and
+            # Qwen4ExpTextExperts, including FP8 weight_scale_inv siblings.
+            router = getattr(moe, model_attrs["router"])
+            slice_fused_expert_weights(moe.experts, retained_expert_indicies)
             moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+            router.weight.data = router.weight.data[retained_expert_indicies].clone()
+            router.out_features = len(retained_expert_indicies)
+            if hasattr(router, "num_experts"):  # transformers >= 4.54+
+                router.num_experts = len(retained_expert_indicies)
+            if hasattr(moe.experts, "num_experts"):
+                moe.experts.num_experts = len(retained_expert_indicies)
+            top_k = getattr(moe, "num_experts_per_tok", None)
+            if top_k is not None and top_k > len(retained_expert_indicies):
+                raise ValueError(
+                    f"Cannot retain {len(retained_expert_indicies)} experts with "
+                    f"top-k routing set to {top_k}"
+                )
 
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     setattr(model.config, model_attrs["num_experts"], retained_experts)
+    # Qwen4-Exp is multimodal: the text MoE configuration is nested under
+    # ``config.text_config``.  Updating only the wrapper config would leave a
+    # reloaded checkpoint configured for the original 512 experts.
+    for nested_config_name in ("text_config", "language_config"):
+        nested_config = getattr(model.config, nested_config_name, None)
+        if nested_config is not None and hasattr(
+            nested_config, model_attrs["num_experts"]
+        ):
+            setattr(nested_config, model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Glm4MoeForCausalLM":
         # GLM's current Transformers/vLLM implementations normally assume one
         # routed-expert count globally. Preserve the actual per-layer counts so
@@ -430,17 +461,12 @@ def main():
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
-        if model_name == "artifacts/models/GLM-4.5-Air":
-            # move modelling file
-            source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"
-            target_file = pruned_model_dir / "modeling_glm4_moe.py"
-            if source_file.exists():
-                shutil.copy2(source_file, target_file)
-                logger.info(f"Copied modeling_glm4_moe.py to {pruned_model_dir}")
-            else:
-                raise RuntimeError(
-                    f"Source file {source_file} does not exist. Cannot copy to {target_file}."
-                )
+        # Preserve any local custom modeling files for remote-code checkpoints;
+        # this is applicable to all model families, not only GLM-4.5-Air.
+        for source_file in pathlib.Path(model_name).glob("modeling_*.py"):
+            target_file = pruned_model_dir / source_file.name
+            shutil.copy2(source_file, target_file)
+            logger.info("Copied %s to %s", source_file.name, pruned_model_dir)
 
         logger.info("Pruning completed.")
 
