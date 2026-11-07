@@ -50,8 +50,10 @@ def allocate_layerwise_pruning_counts(
     total_experts_to_prune: int,
     *,
     epsilon: float = 1e-12,
+    layer_importance: dict[int, float] | None = None,
+    min_experts_per_layer: int = 1,
 ) -> dict[int, int]:
-    """Allocate a global pruning budget using inverse MoE contribution.
+    """Allocate a global pruning budget using inverse layer importance.
 
     Lower-contribution layers receive a larger pruning fraction. Allocation is
     deterministic, respects the one-expert-per-layer lower bound, and returns
@@ -60,12 +62,14 @@ def allocate_layerwise_pruning_counts(
     layers = list(observer_data)
     if not layers:
         return {}
+    if min_experts_per_layer < 1:
+        raise ValueError("min_experts_per_layer must be positive")
 
     sizes = {
         layer: int(observer_data[layer]["expert_frequency"].shape[0])
         for layer in layers
     }
-    maximum = sum(max(size - 1, 0) for size in sizes.values())
+    maximum = sum(max(size - min_experts_per_layer, 0) for size in sizes.values())
     if not 0 <= total_experts_to_prune <= maximum:
         raise ValueError(
             f"Requested {total_experts_to_prune} expert removals, but the valid "
@@ -74,22 +78,27 @@ def allocate_layerwise_pruning_counts(
 
     priorities = {}
     for layer in layers:
-        contribution = observer_data[layer].get("moe_residual_contribution")
-        if contribution is None:
-            raise ValueError(
-                "layerwise_seap requires 'moe_residual_contribution' for every "
-                f"MoE layer; missing layer {layer}."
-            )
-        value = float(torch.as_tensor(contribution).item())
+        if layer_importance is None:
+            contribution = observer_data[layer].get("moe_residual_contribution")
+            if contribution is None:
+                raise ValueError(
+                    "layerwise_seap requires 'moe_residual_contribution' for every "
+                    f"MoE layer; missing layer {layer}."
+                )
+            value = float(torch.as_tensor(contribution).item())
+        else:
+            if layer not in layer_importance:
+                raise ValueError(f"Missing layer importance for layer {layer}.")
+            value = float(layer_importance[layer])
         if not torch.isfinite(torch.tensor(value)) or value < 0:
             raise ValueError(
-                f"Invalid MoE residual contribution for layer {layer}: {value}"
+                f"Invalid layer importance for layer {layer}: {value}"
             )
         priorities[layer] = 1.0 / max(value, epsilon)
 
     counts = {layer: 0 for layer in layers}
     remaining = total_experts_to_prune
-    active = [layer for layer in layers if sizes[layer] > 1]
+    active = [layer for layer in layers if sizes[layer] > min_experts_per_layer]
 
     # Water-fill capped layers first, then use largest remainder allocation.
     while remaining and active:
@@ -98,18 +107,16 @@ def allocate_layerwise_pruning_counts(
             layer: remaining * sizes[layer] * priorities[layer] / denominator
             for layer in active
         }
-        capped = [
-            layer for layer in active if raw[layer] >= sizes[layer] - 1
-        ]
+        capped = [layer for layer in active if raw[layer] >= sizes[layer] - min_experts_per_layer]
         if capped:
             for layer in capped:
-                cap = sizes[layer] - 1
+                cap = sizes[layer] - min_experts_per_layer
                 counts[layer] = cap
                 remaining -= cap
                 active.remove(layer)
             continue
 
-        floors = {layer: min(int(raw[layer]), sizes[layer] - 1) for layer in active}
+        floors = {layer: min(int(raw[layer]), sizes[layer] - min_experts_per_layer) for layer in active}
         for layer, count in floors.items():
             counts[layer] += count
         remaining -= sum(floors.values())
@@ -122,7 +129,7 @@ def allocate_layerwise_pruning_counts(
             for layer in ranked:
                 if not remaining:
                     break
-                if counts[layer] < sizes[layer] - 1:
+                if counts[layer] < sizes[layer] - min_experts_per_layer:
                     counts[layer] += 1
                     remaining -= 1
         break

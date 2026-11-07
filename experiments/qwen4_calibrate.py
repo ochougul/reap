@@ -233,7 +233,11 @@ def _install_qwen4_deepgemm_capture_dispatch() -> None:
     _QWEN4_DEEPGEMM_CAPTURE_PATCHED = True
 
 
-def _wrap_qwen4_expert_forward(experts: torch.nn.Module, layer: int | None = None) -> None:
+def _wrap_qwen4_expert_forward(
+    experts: torch.nn.Module,
+    layer: int | None = None,
+    router: torch.nn.Module | None = None,
+) -> None:
     original_forward = experts.forward
 
     def wrapped_forward(*args, **kwargs):
@@ -243,60 +247,91 @@ def _wrap_qwen4_expert_forward(experts: torch.nn.Module, layer: int | None = Non
             return original_forward(*args, **kwargs)
         top_k_index = args[1]
         expert_ids, perm = torch.sort(top_k_index.reshape(-1))
-        if _QWEN4_SENSITIVITY_ENABLED:
-            if layer is None:
-                raise RuntimeError("Sensitivity capture requires a layer-indexed expert call")
-            route = _QWEN4_SENSITIVITY_CURRENT["routes"].get(layer)
-            if route is None:
-                raise RuntimeError(f"Missing router result for sensitivity layer {layer}")
-            logits = route[0].reshape(-1, route[0].shape[-1]).float()
-            top11 = logits.topk(11, dim=-1, sorted=True).indices
-            probs11 = logits.softmax(dim=-1).gather(1, top11).float()
-            probs11 = probs11 / probs11.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-            selected = route[4].reshape(-1, route[4].shape[-1])
-            _QWEN4_SENSITIVITY_CURRENT["sensitivity"][layer] = {
-                "candidate_ids": top11.detach(),
-                "candidate_probs": probs11.detach(),
-                "selected_ids": selected.detach(),
-                "selected_weights": route[5].reshape_as(selected).float().detach(),
-                "routing_scale": route[5].reshape_as(selected).float().sum(-1).detach(),
-                "dots": torch.zeros(
-                    (top11.shape[0], 11), device=top11.device, dtype=torch.float32
-                ),
-                "seen": torch.zeros(
-                    (top11.shape[0], 11), device=top11.device, dtype=torch.bool
-                ),
-            }
         previous = _QWEN4_CAPTURE_CONTEXT
-        _QWEN4_CAPTURE_CONTEXT = SimpleNamespace(
-            callback=callback,
-            expert_ids=expert_ids,
-            perm=perm,
-            num_top_k=top_k_index.shape[-1],
-            calls=0,
-        )
         try:
-            output = original_forward(*args, **kwargs)
             if not _QWEN4_SENSITIVITY_ENABLED:
-                return output
+                _QWEN4_CAPTURE_CONTEXT = SimpleNamespace(
+                    callback=callback,
+                    expert_ids=expert_ids,
+                    perm=perm,
+                    num_top_k=top_k_index.shape[-1],
+                    calls=0,
+                )
+                return original_forward(*args, **kwargs)
 
-            if layer is None or len(args) < 3:
-                raise RuntimeError("Sensitivity capture requires a layer-indexed expert call")
+            if layer is None:
+                raise RuntimeError("Output sensitivity capture requires a layer-indexed expert call")
             route = _QWEN4_SENSITIVITY_CURRENT["routes"].get(layer)
             if route is None:
-                raise RuntimeError(f"Missing router result for sensitivity layer {layer}")
+                raise RuntimeError(f"Missing router result for output-sensitivity layer {layer}")
             logits = route[0].reshape(-1, route[0].shape[-1]).float()
-            top11 = logits.topk(11, dim=-1, sorted=True).indices
+            selected = route[4].reshape(-1, route[4].shape[-1])
+            if selected.shape != (logits.shape[0], 10):
+                raise RuntimeError(
+                    f"Expected the actual router to select ten experts, got {tuple(selected.shape)}"
+                )
+            # Match the gate's exact score domain (softmax probabilities), then
+            # append the highest-probability expert excluded from its actual
+            # top-10. This also remains well-defined if softmax rounding creates
+            # ties that differ from a top-k directly on lower-precision logits.
+            all_probs = logits.softmax(dim=-1)
+            excluded_probs = all_probs.clone()
+            excluded_probs.scatter_(1, selected, -torch.inf)
+            eleventh_id = excluded_probs.argmax(dim=-1, keepdim=True)
+            if (all_probs.gather(1, eleventh_id) > all_probs.gather(1, selected).min(-1, keepdim=True).values).any():
+                raise RuntimeError("The appended candidate outranks a selected top-10 expert")
+            top11 = torch.cat((selected, eleventh_id), dim=-1)
+            probs11 = all_probs.gather(1, top11)
+            probs11 = probs11 / probs11.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+            selected_weights = route[5].reshape_as(selected).float()
+            if router is None:
+                raise RuntimeError("Output sensitivity capture requires the layer router")
+            selected_probs = all_probs.gather(1, selected)
+            if getattr(router, "norm_topk_prob", False):
+                routed_scale = selected_weights.sum(-1, keepdim=True)
+                expected_weights = routed_scale * selected_probs / selected_probs.sum(
+                    -1, keepdim=True
+                ).clamp_min(1e-20)
+            else:
+                routed_scale = (
+                    (selected_weights * selected_probs).sum(-1, keepdim=True)
+                    / selected_probs.square().sum(-1, keepdim=True).clamp_min(1e-20)
+                )
+                expected_weights = routed_scale * selected_probs
+            if not torch.allclose(
+                selected_weights, expected_weights, rtol=1e-2, atol=5e-4
+            ):
+                max_error = float((selected_weights - expected_weights).abs().max())
+                raise RuntimeError(
+                    "Captured top-10 router weights disagree with softmax and the "
+                    "router's norm_topk_prob/scaling settings "
+                    f"(max_abs_error={max_error:.6g})"
+                )
             extra_ids = top11[:, -1:].to(device=top_k_index.device)
             extra_weights = torch.ones(
                 extra_ids.shape,
                 dtype=args[2].dtype,
                 device=args[2].device,
             )
-            # Evaluate only the eleventh candidate, then attach a zero-valued
-            # surrogate to the ordinary top-10 output. This preserves the
-            # baseline forward exactly while exposing the missing local
-            # expert direction to autograd.
+            current = _QWEN4_SENSITIVITY_CURRENT
+            current["sensitivity"][layer] = {
+                "candidate_ids": top11.detach(),
+                "candidate_probs": probs11.detach(),
+                "selected_ids": selected.detach(),
+                "selected_weights": selected_weights.detach(),
+                "routed_scale": routed_scale.reshape(-1).detach(),
+                "eleventh_output": torch.empty(
+                    (top11.shape[0], args[0].shape[-1]),
+                    device=extra_ids.device,
+                    dtype=args[0].dtype,
+                ),
+                "eleventh_seen": torch.zeros(
+                    top11.shape[0], device=top11.device, dtype=torch.bool
+                ),
+            }
+
+            # Evaluate the replacement expert separately, but do not add its
+            # result to the model output. The baseline remains exactly top-10.
             sorted_extra_ids, extra_perm = torch.sort(extra_ids.reshape(-1))
             _QWEN4_CAPTURE_CONTEXT = SimpleNamespace(
                 callback=callback,
@@ -305,14 +340,23 @@ def _wrap_qwen4_expert_forward(experts: torch.nn.Module, layer: int | None = Non
                 num_top_k=1,
                 calls=0,
             )
-            _QWEN4_SENSITIVITY_CURRENT["capture_mode"] = "eleventh"
-            extra_output = original_forward(
+            current["capture_mode"] = "eleventh"
+            original_forward(
                 args[0], extra_ids, extra_weights, *args[3:], **kwargs
             )
-            _QWEN4_SENSITIVITY_CURRENT["capture_mode"] = "ordinary"
-            if not torch.is_tensor(output) or not torch.is_tensor(extra_output):
-                raise RuntimeError("Qwen expert forward must return a tensor for sensitivity mode")
-            return output + extra_output - extra_output.detach()
+            payload = current["sensitivity"].get(layer)
+            if payload is None or not payload["eleventh_seen"].all():
+                raise RuntimeError(f"Layer {layer} did not capture all candidate-11 outputs")
+
+            _QWEN4_CAPTURE_CONTEXT = SimpleNamespace(
+                callback=callback,
+                expert_ids=expert_ids,
+                perm=perm,
+                num_top_k=top_k_index.shape[-1],
+                calls=0,
+            )
+            current["capture_mode"] = "ordinary"
+            return original_forward(*args, **kwargs)
         finally:
             if _QWEN4_SENSITIVITY_ENABLED:
                 _QWEN4_SENSITIVITY_CURRENT["capture_mode"] = "ordinary"
@@ -368,10 +412,10 @@ OUTPUT_DIR = pathlib.Path(
     os.environ.get(
         "QWEN4_OUTPUT_DIR",
         (
-            "artifacts/Qwen3.8-Flash-Next-FP8/sensitivity-smoke-evol-codealpaca-"
+            "artifacts/Qwen3.8-Flash-Next-FP8/local-output-sensitivity-smoke-evol-codealpaca-"
             f"{SENSITIVITY_SMOKE_SAMPLES}-16384-unpruned"
             if SENSITIVITY_SMOKE_SAMPLES
-            else "artifacts/Qwen3.8-Flash-Next-FP8/sensitivity-evol-codealpaca-12228-16384-unpruned"
+            else "artifacts/Qwen3.8-Flash-Next-FP8/local-output-sensitivity-evol-codealpaca-12228-16384-unpruned"
             if SENSITIVITY_MODE
             else "artifacts/Qwen3.8-Flash-Next-FP8/evol-codealpaca"
         ),
@@ -520,66 +564,118 @@ def _prepare_sensitivity_samples(tokenizer) -> tuple[list[dict], dict]:
     return samples, manifest
 
 
-def _first_order_top11_removal(
-    candidate_ids: torch.Tensor,
+def _top11_local_output_delta_squares(
+    *,
     candidate_probs: torch.Tensor,
-    projected_expert_outputs: torch.Tensor,
-    routing_scale: torch.Tensor | float = 1.0,
+    selected_ids: torch.Tensor,
+    selected_weights: torch.Tensor,
+    routed_scale: float | torch.Tensor,
+    eleventh_output: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_outputs: torch.Tensor,
+    route_permutation: torch.Tensor,
+    num_experts: int,
+    chunk_tokens: int = 512,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project each top-10-to-top-11 renormalized removal onto dL/d(MoE output).
+    """Return per-expert sum(||delta MoE output||^2) and occurrence counts.
 
-    ``projected_expert_outputs[t, j]`` is the scalar inner product of the
-    unweighted expert output with the CE gradient for token ``t``. The first
-    ten candidates are the baseline route; removing one replaces it with the
-    eleventh candidate, then renormalizes over the remaining ten.
+    The callback outputs are sorted by expert. `route_permutation` maps each
+    output row back to the flattened original [token, top-k slot] ordering.
+    Only one top-k slot is materialized at a time to bound peak memory.
     """
-    if candidate_ids.ndim != 2 or candidate_ids.shape[-1] != 11:
-        raise ValueError("Expected [tokens, 11] candidate expert IDs")
-    if candidate_probs.shape != candidate_ids.shape:
-        raise ValueError("Candidate probabilities must match candidate expert IDs")
-    if projected_expert_outputs.shape != candidate_ids.shape:
-        raise ValueError("Projected expert outputs must match candidate expert IDs")
-    probs = candidate_probs.float()
-    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-    projected = projected_expert_outputs.float()
-    # The actual unpruned top-10 route is normalized independently of the
-    # eleventh candidate. This matches router top-k renormalization.
-    original = probs[:, :10]
-    original = original / original.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-    estimates = torch.empty_like(original)
-    for removed in range(10):
-        remaining = probs.clone()
-        remaining[:, removed] = 0
-        remaining = remaining / remaining.sum(dim=-1, keepdim=True).clamp_min(1e-20)
-        estimates[:, removed] = (
-            (remaining * projected).sum(-1)
-            - (original * projected[:, :10]).sum(-1)
-        ) * torch.as_tensor(
-            routing_scale, dtype=projected.dtype, device=projected.device
-        ).reshape(-1).expand(projected.shape[0])
-    return candidate_ids[:, :10], estimates
+    if candidate_probs.ndim != 2 or candidate_probs.shape[-1] != 11:
+        raise ValueError("Expected normalized probabilities for 11 router candidates")
+    tokens = candidate_probs.shape[0]
+    if selected_ids.shape != (tokens, 10) or selected_weights.shape != (tokens, 10):
+        raise ValueError("Expected ten selected expert IDs and weights per token")
+    if eleventh_output.ndim != 2 or eleventh_output.shape[0] != tokens:
+        raise ValueError("Candidate-11 outputs must have shape [tokens, hidden]")
+    if expert_outputs.ndim != 2 or expert_outputs.shape[1] != eleventh_output.shape[1]:
+        raise ValueError("Routed outputs and candidate-11 outputs must share hidden size")
+    if expert_ids.numel() != tokens * 10 or route_permutation.numel() != tokens * 10:
+        raise ValueError("Expected one routed output row per top-10 token/expert pair")
 
+    device = expert_outputs.device
+    token_rows = route_permutation.reshape(-1).long() // 10
+    slot_rows = route_permutation.reshape(-1).long() % 10
+    expert_ids = expert_ids.reshape(-1).long()
+    if token_rows.min() < 0 or token_rows.max() >= tokens:
+        raise ValueError("Routed-output permutation refers to an invalid token")
+    if not torch.equal(selected_ids[token_rows, slot_rows], expert_ids):
+        raise RuntimeError("Routed output rows do not align with the captured top-10 route")
+    if (expert_ids >= num_experts).any():
+        raise RuntimeError("Sensitivity mode does not support EP sentinel expert rows")
 
-def _accumulate_sample_sensitivity(state: dict[int, dict], current: dict) -> None:
-    for layer, payload in current["sensitivity"].items():
-        if not payload["seen"].all():
-            missing = int((~payload["seen"]).sum().item())
-            raise RuntimeError(
-                f"Layer {layer} did not receive gradients for {missing} top-11 expert outputs"
+    probabilities = candidate_probs.float()
+    probabilities = probabilities / probabilities.sum(-1, keepdim=True).clamp_min(1e-20)
+    weights = selected_weights.to(device=device, dtype=torch.float32)
+    scale = torch.as_tensor(routed_scale, device=device, dtype=torch.float32).reshape(-1)
+    if scale.numel() == 1:
+        scale = scale.expand(tokens)
+    if scale.shape != (tokens,) or (scale <= 0).any():
+        raise RuntimeError("Router produced an invalid routed scaling factor")
+    if (probabilities[:, :10].sum(-1) <= 0).any():
+        raise RuntimeError("Router produced a non-positive selected-route mass")
+
+    # Reconstruct the unchanged top-10 mixture once from the actual routed
+    # outputs and weights. Then use the top-11 probabilities to replace each
+    # selected expert, preserving the original total router scale.
+    baseline = torch.zeros(
+        (tokens, expert_outputs.shape[-1]), device=device, dtype=torch.float32
+    )
+    baseline.index_add_(
+        0,
+        token_rows,
+        expert_outputs.float() * weights[token_rows, slot_rows, None],
+    )
+    probability_weighted_sum = torch.zeros_like(baseline)
+    probability_weighted_sum.index_add_(
+        0,
+        token_rows,
+        expert_outputs.float() * probabilities[token_rows, slot_rows, None],
+    )
+    rows_by_slot = torch.full((tokens, 10), -1, device=device, dtype=torch.long)
+    rows_by_slot[token_rows, slot_rows] = torch.arange(tokens * 10, device=device)
+    if (rows_by_slot < 0).any():
+        raise RuntimeError("Missing routed expert output for a token/top-k slot")
+
+    replacement = eleventh_output.float()
+    replacement_prob = probabilities[:, 10]
+    squared_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
+    occurrence_count = torch.zeros(num_experts, device=device, dtype=torch.long)
+    for slot in range(10):
+        for start in range(0, tokens, chunk_tokens):
+            stop = min(start + chunk_tokens, tokens)
+            rows = rows_by_slot[start:stop, slot]
+            current_ids = selected_ids[start:stop, slot].to(device=device, dtype=torch.long)
+            removed_prob = probabilities[start:stop, slot]
+            denominator = (1.0 - removed_prob).clamp_min(1e-12)
+            current_baseline = baseline[start:stop]
+            current_expert_output = expert_outputs[rows].float()
+            counterfactual = (
+                probability_weighted_sum[start:stop]
+                + replacement_prob[start:stop, None] * replacement[start:stop]
+                - removed_prob[:, None] * current_expert_output
+            ) / denominator[:, None]
+            counterfactual = counterfactual * scale[start:stop, None]
+            delta = counterfactual - current_baseline
+            delta_squared_norm = delta.square().sum(-1).double()
+            squared_sum.scatter_add_(0, current_ids, delta_squared_norm)
+            occurrence_count.scatter_add_(
+                0, current_ids, torch.ones_like(current_ids, dtype=torch.long)
             )
-        expert_ids, estimates = _first_order_top11_removal(
-            payload["candidate_ids"],
-            payload["candidate_probs"],
-            payload["dots"],
-            payload["routing_scale"],
-        )
-        totals = torch.zeros(
-            state[layer]["sensitivity_sum"].shape,
-            dtype=torch.float64,
-            device=estimates.device,
-        )
-        totals.scatter_add_(0, expert_ids.reshape(-1), estimates.reshape(-1).double())
-        state[layer]["sensitivity_sum"] += totals.cpu()
+    return squared_sum, occurrence_count
+
+
+def _local_output_rms(squared_sum: torch.Tensor, occurrence_count: torch.Tensor) -> torch.Tensor:
+    """Aggregate independent local MoE-output deltas into per-expert RMS-L2."""
+    if squared_sum.ndim != 1 or occurrence_count.shape != squared_sum.shape:
+        raise ValueError("Expected matching one-dimensional sums and counts")
+    if (occurrence_count < 0).any() or (squared_sum < 0).any():
+        raise ValueError("Squared sums and occurrence counts must be non-negative")
+    return torch.sqrt(
+        squared_sum / occurrence_count.clamp_min(1).to(dtype=squared_sum.dtype)
+    )
 
 
 def _save_sensitivity_checkpoint(
@@ -588,15 +684,15 @@ def _save_sensitivity_checkpoint(
     stability: RouterStabilityCollector,
     manifest: dict,
     processed_examples: int,
-    target_tokens: int,
+    processed_tokens: int,
     elapsed_seconds: float,
 ) -> None:
-    checkpoint = output_dir / f"sensitivity_checkpoint_{processed_examples:09d}.pt"
+    checkpoint = output_dir / f"local_output_sensitivity_checkpoint_{processed_examples:09d}.pt"
     torch.save(
         {
             "state": state,
             "processed_examples": processed_examples,
-            "target_tokens": target_tokens,
+            "processed_tokens": processed_tokens,
             "elapsed_seconds": elapsed_seconds,
             "sample_set_sha256": manifest["sample_set_sha256"],
             "stability_accumulators": stability.accumulators,
@@ -609,11 +705,11 @@ def _save_sensitivity_checkpoint(
         checkpoint,
     )
     stability.save_accumulators(
-        output_dir / f"router_stability_checkpoint_{processed_examples:09d}.npz"
+        output_dir / f"local_output_router_stability_checkpoint_{processed_examples:09d}.npz"
     )
     print(
         f"Saved sensitivity checkpoint: {checkpoint} "
-        f"(examples={processed_examples}, target_tokens={target_tokens})",
+        f"(examples={processed_examples}, tokens={processed_tokens})",
         flush=True,
     )
 
@@ -624,7 +720,7 @@ def _restore_sensitivity_checkpoint(
     stability: RouterStabilityCollector,
     manifest: dict,
 ) -> tuple[int, int, float]:
-    checkpoints = sorted(output_dir.glob("sensitivity_checkpoint_*.pt"))
+    checkpoints = sorted(output_dir.glob("local_output_sensitivity_checkpoint_*.pt"))
     if not checkpoints:
         return 0, 0, 0.0
     checkpoint = torch.load(checkpoints[-1], map_location="cpu", weights_only=False)
@@ -643,29 +739,19 @@ def _restore_sensitivity_checkpoint(
     stability.generator.set_state(checkpoint["stability_generator_state"])
     return (
         int(checkpoint["processed_examples"]),
-        int(checkpoint["target_tokens"]),
+        int(checkpoint["processed_tokens"]),
         float(checkpoint["elapsed_seconds"]),
     )
 
 
-def _enable_input_gradients(model) -> torch.utils.hooks.RemovableHandle:
-    embedding = model.get_input_embeddings()
-
-    def require_grad(_module, _inputs, output):
-        if not torch.is_tensor(output):
-            raise RuntimeError("Input embedding output is not a tensor")
-        output.requires_grad_(True)
-        return output
-
-    return embedding.register_forward_hook(require_grad)
-
-
 def _patch_sensitivity_rotary_device(model) -> None:
-    """Keep text positions with Qwen's sharded rotary-frequency tensor."""
+    """Keep Qwen position IDs beside rotary frequencies under layer sharding."""
     for module in model.modules():
         if not module.__class__.__name__.lower().endswith("rotaryembedding"):
             continue
-        if not hasattr(module, "inv_freq") or getattr(module, "_reap_position_device_patch", False):
+        if not hasattr(module, "inv_freq") or getattr(
+            module, "_reap_position_device_patch", False
+        ):
             continue
         original_forward = module.forward
 
@@ -677,7 +763,7 @@ def _patch_sensitivity_rotary_device(model) -> None:
         module._reap_position_device_patch = True
 
 
-def _forward_backward_sensitivity_sample(
+def _forward_local_output_sensitivity_sample(
     model,
     sample: dict[str, torch.Tensor],
     input_device: torch.device,
@@ -699,22 +785,18 @@ def _forward_backward_sensitivity_sample(
         "use_cache": False,
         "return_dict": True,
     }
-    outputs = model(**inputs)
-    logits = outputs.logits[:, :-1, :]
-    targets = inputs["input_ids"][:, 1:].to(logits.device)
-    if logits.shape[:2] != targets.shape or targets.numel() != input_ids.shape[-1] - 1:
-        raise RuntimeError("Causal CE alignment did not cover every real target token")
-    loss_sum = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]), targets.reshape(-1), reduction="sum"
-    )
-    if not torch.isfinite(loss_sum):
-        raise RuntimeError("Non-finite next-token cross-entropy in sensitivity calibration")
-    target_count = int(targets.numel())
-    loss_sum.backward()
-    del loss_sum, logits, targets, outputs
-    _accumulate_sample_sensitivity(state, current)
-    model.zero_grad(set_to_none=True)
-    return target_count
+    with torch.no_grad():
+        model.model(**inputs)
+    if current["sensitivity"] and any(
+        not torch.isfinite(payload["eleventh_output"]).all()
+        or not payload["eleventh_seen"].all()
+        for payload in current["sensitivity"].values()
+    ):
+        raise RuntimeError("Candidate-11 expert outputs were incomplete or non-finite")
+    for layer, layer_state in state.items():
+        if not torch.isfinite(layer_state["local_output_delta_squared_sum"]).all():
+            raise RuntimeError(f"Layer {layer} produced non-finite local output deltas")
+    return int(input_ids.shape[-1])
 
 
 def _top_k(router: torch.nn.Module) -> int:
@@ -1134,51 +1216,43 @@ def main() -> None:
                 payload = current["sensitivity"].get(layer)
                 if payload is None:
                     raise RuntimeError(f"Missing sensitivity payload for layer {layer}")
-                if not expert_outputs.requires_grad:
-                    raise RuntimeError(
-                        "The selected Qwen expert kernel does not expose routed outputs "
-                        "to autograd; first-order sensitivity is unsupported"
-                    )
-                token_rows = (perm.reshape(-1) // num_top_k).to(torch.long)
                 expert_rows = expert_ids.reshape(-1).to(torch.long)
-                candidate_match = (
-                    payload["candidate_ids"][token_rows] == expert_rows[:, None]
-                )
-                if not candidate_match.any(dim=-1).all():
-                    raise RuntimeError("A dispatched expert is missing from its top-11 route")
-                candidate_slot = candidate_match.to(torch.long).argmax(dim=-1)
                 if capture_mode == "eleventh":
-                    applied_weight = torch.ones_like(token_rows, dtype=torch.float32)
-                else:
-                    selected_match = (
-                        payload["selected_ids"][token_rows] == expert_rows[:, None]
+                    if num_top_k != 1 or perm.numel() != payload["candidate_ids"].shape[0]:
+                        raise RuntimeError("Candidate-11 callback has an unexpected token layout")
+                    token_rows = perm.reshape(-1).to(torch.long)
+                    candidate_ids = payload["candidate_ids"]
+                    if not torch.equal(
+                        candidate_ids[token_rows, 10].to(expert_rows.device), expert_rows
+                    ):
+                        raise RuntimeError("Candidate-11 callback rows do not align with tokens")
+                    if (expert_rows >= num_experts).any():
+                        raise RuntimeError("Candidate-11 route contains an invalid expert id")
+                    if payload["eleventh_seen"][token_rows].any():
+                        raise RuntimeError("Candidate-11 output was captured twice for a token")
+                    payload["eleventh_output"].index_copy_(
+                        0, token_rows, expert_outputs.detach()
                     )
-                    if not selected_match.any(dim=-1).all():
-                        raise RuntimeError("An ordinary dispatched expert is not in top-10")
-                    selected_slot = selected_match.to(torch.long).argmax(dim=-1)
-                    applied_weight = payload["selected_weights"][token_rows, selected_slot]
-                row_keep = expert_rows < num_experts
-                rows = torch.arange(expert_rows.numel(), device=expert_rows.device)[row_keep]
-                token_rows = token_rows[row_keep]
-                candidate_slot = candidate_slot[row_keep]
-                applied_weight = applied_weight[row_keep].clamp_min(1e-20)
-                detached_outputs = expert_outputs.detach()
-
-                def collect_projection(grad, *, payload=payload, rows=rows,
-                                       token_rows=token_rows, candidate_slot=candidate_slot,
-                                       applied_weight=applied_weight,
-                                       detached_outputs=detached_outputs):
-                    projection = (
-                        detached_outputs[rows].float() * grad[rows].float()
-                    ).sum(dim=-1) / applied_weight
-                    with torch.no_grad():
-                        payload["dots"][token_rows, candidate_slot] = projection
-                        payload["seen"][token_rows, candidate_slot] = True
-                    return grad
-
-                expert_outputs.register_hook(collect_projection)
-                if capture_mode == "eleventh":
+                    payload["eleventh_seen"][token_rows] = True
                     return
+
+                if num_top_k != top_k or top_k != 10:
+                    raise RuntimeError(
+                        f"Expected ordinary top-{top_k} output callback, got top-{num_top_k}"
+                    )
+                sum_squares, occurrence_count = _top11_local_output_delta_squares(
+                    candidate_probs=payload["candidate_probs"],
+                    selected_ids=payload["selected_ids"],
+                    selected_weights=payload["selected_weights"],
+                    routed_scale=payload["routed_scale"],
+                    eleventh_output=payload["eleventh_output"],
+                    expert_ids=expert_rows,
+                    expert_outputs=expert_outputs.detach(),
+                    route_permutation=perm,
+                    num_experts=num_experts,
+                )
+                state[layer]["local_output_delta_squared_sum"] += sum_squares.cpu()
+                state[layer]["local_output_occurrence_count"] += occurrence_count.cpu()
 
             selected = route[4].reshape(-1, num_top_k)
             logits = route[0]
@@ -1230,18 +1304,22 @@ def main() -> None:
         state[layer]["moe_residual_contribution_sum"] = torch.zeros((), dtype=torch.float64)
         state[layer]["moe_residual_contribution_count"] = torch.zeros((), dtype=torch.long)
         if SENSITIVITY_MODE:
-            state[layer]["sensitivity_sum"] = torch.zeros(num_experts, dtype=torch.float64)
+            state[layer]["local_output_delta_squared_sum"] = torch.zeros(
+                num_experts, dtype=torch.float64
+            )
+            state[layer]["local_output_occurrence_count"] = torch.zeros(
+                num_experts, dtype=torch.long
+            )
         handles.append(module.register_forward_hook(make_moe_hook(layer, module)))
         _wrap_qwen4_router_forward(router, layer, current)
         module.experts._reap_capture_callback = make_callback(layer, num_experts, top_k)
-        _wrap_qwen4_expert_forward(module.experts, layer)
+        _wrap_qwen4_expert_forward(module.experts, layer, router)
 
     expected_layers = int(getattr(text_config, "num_hidden_layers", 0))
     if len(layer_names) != expected_layers:
         raise RuntimeError(f"Expected {expected_layers} Qwen4 MoE layers, found {layer_names}")
 
     input_device = model.get_input_embeddings().weight.device
-    input_gradient_handle = _enable_input_gradients(model) if SENSITIVITY_MODE else None
     calibration_started = time.perf_counter()
     total_examples = total_tokens = 0
     next_checkpoint = CHECKPOINT_EVERY if CHECKPOINT_EVERY > 0 else None
@@ -1254,7 +1332,7 @@ def main() -> None:
     try:
         if SENSITIVITY_MODE:
             assert sample_manifest is not None
-            existing = sorted(output_dir.glob("sensitivity_checkpoint_*.pt"))
+            existing = sorted(output_dir.glob("local_output_sensitivity_checkpoint_*.pt"))
             if not existing:
                 longest = max(
                     range(len(batches)), key=lambda index: batches[index]["input_ids"].shape[-1]
@@ -1262,16 +1340,16 @@ def main() -> None:
                 longest_length = int(batches[longest]["input_ids"].shape[-1])
                 longest_row = sample_manifest["selected_row_indices"][longest]
                 print(
-                    "Running required sensitivity feasibility check on longest selected row: "
+                    "Running required local-output sensitivity feasibility check on longest selected row: "
                     f"index={longest_row}, tokens={longest_length}",
                     flush=True,
                 )
                 try:
-                    _forward_backward_sensitivity_sample(
+                    _forward_local_output_sensitivity_sample(
                         model, batches[longest], input_device, current, state, -1
                     )
                 except (RuntimeError, torch.cuda.OutOfMemoryError) as exc:
-                    (output_dir / "sensitivity_run_status.json").write_text(
+                    (output_dir / "local_output_sensitivity_run_status.json").write_text(
                         json.dumps(
                             {
                                 "status": "stopped_at_longest_sequence_feasibility_check",
@@ -1280,7 +1358,7 @@ def main() -> None:
                                 "row_index": longest_row,
                                 "sequence_tokens": longest_length,
                                 "feasibility_passed": False,
-                                "gradient_capture_status": "not established",
+                                "gradient_capture_status": "not_required",
                                 "calibration_scores_written": False,
                                 "error": str(exc),
                                 "partial_preflight_artifacts": (
@@ -1293,7 +1371,7 @@ def main() -> None:
                         + "\n"
                     )
                     message = (
-                        "Longest-sequence sensitivity feasibility check failed; "
+                        "Longest-sequence local-output sensitivity feasibility check failed; "
                         "the requested calibration was not weakened or substituted. "
                         f"row_index={longest_row}, tokens={longest_length}, error={exc}"
                     )
@@ -1302,10 +1380,11 @@ def main() -> None:
                     ):
                         torch.cuda.empty_cache()
                     raise RuntimeError(message) from exc
-                if any(not torch.isfinite(value).all() for value in (
-                    payload["dots"] for payload in current["sensitivity"].values()
-                )):
-                    raise RuntimeError("Feasibility check produced non-finite expert projections")
+                if any(
+                    not torch.isfinite(layer_state["local_output_delta_squared_sum"]).all()
+                    for layer_state in state.values()
+                ):
+                    raise RuntimeError("Feasibility check produced non-finite local output deltas")
 
                 # The preflight validates the exact longest-row path but is
                 # excluded from the calibration aggregates.
@@ -1319,8 +1398,11 @@ def main() -> None:
                     state[layer]["moe_residual_contribution_count"] = torch.zeros(
                         (), dtype=torch.long
                     )
-                    state[layer]["sensitivity_sum"] = torch.zeros(
+                    state[layer]["local_output_delta_squared_sum"] = torch.zeros(
                         num_experts, dtype=torch.float64
+                    )
+                    state[layer]["local_output_occurrence_count"] = torch.zeros(
+                        num_experts, dtype=torch.long
                     )
                 stability = RouterStabilityCollector(
                     stability_dir,
@@ -1334,14 +1416,14 @@ def main() -> None:
                 current["routes"].clear()
                 current["sensitivity"].clear()
 
-            start_index, target_tokens, prior_seconds = _restore_sensitivity_checkpoint(
+            start_index, processed_tokens, prior_seconds = _restore_sensitivity_checkpoint(
                 output_dir, state, stability, sample_manifest
             )
             total_examples = start_index
             total_tokens = sum(sample_manifest["token_lengths"][:start_index])
             calibration_started = time.perf_counter()
             for sample_index in range(start_index, len(batches)):
-                target_tokens += _forward_backward_sensitivity_sample(
+                processed_tokens += _forward_local_output_sensitivity_sample(
                     model,
                     batches[sample_index],
                     input_device,
@@ -1360,7 +1442,7 @@ def main() -> None:
                         stability,
                         sample_manifest,
                         total_examples,
-                        target_tokens,
+                        processed_tokens,
                         prior_seconds + time.perf_counter() - calibration_started,
                     )
             calibration_seconds = prior_seconds + time.perf_counter() - calibration_started
@@ -1370,7 +1452,7 @@ def main() -> None:
                 stability,
                 sample_manifest,
                 total_examples,
-                target_tokens,
+                processed_tokens,
                 calibration_seconds,
             )
         else:
@@ -1412,8 +1494,6 @@ def main() -> None:
         progress.close()
         for handle in handles:
             handle.remove()
-        if input_gradient_handle is not None:
-            input_gradient_handle.remove()
         for module in model.modules():
             experts = getattr(module, "experts", None)
             if experts is not None and hasattr(experts, "_reap_capture_callback"):
@@ -1453,6 +1533,12 @@ def main() -> None:
                 raise RuntimeError(f"Layer {layer} REAP observation count is inconsistent")
             if int(layer_state["moe_residual_contribution_count"].item()) != total_tokens:
                 raise RuntimeError(f"Layer {layer} MoE contribution count is inconsistent")
+            if not torch.equal(
+                layer_state["local_output_occurrence_count"], frequencies
+            ):
+                raise RuntimeError(
+                    f"Layer {layer} local-output sensitivity counts disagree with routing frequencies"
+                )
     if ep_enabled:
         assert dist is not None
         _all_reduce_ep_state(state, dist, rank)
@@ -1468,27 +1554,31 @@ def main() -> None:
             if hasattr(value, "mean") and not torch.is_tensor(value):
                 layer_state[key] = value.mean
         if SENSITIVITY_MODE:
-            signed_sum = layer_state.pop("sensitivity_sum")
-            signed_per_target = signed_sum / max(target_tokens, 1)
+            squared_sum = layer_state.pop("local_output_delta_squared_sum")
+            occurrence_count = layer_state.pop("local_output_occurrence_count")
+            rms_scores = _local_output_rms(squared_sum, occurrence_count)
             reap_scores = torch.as_tensor(layer_state["reap"])
             removal_order = torch.argsort(reap_scores, stable=True)
             cumulative = torch.cat((
                 torch.zeros(1, dtype=torch.float64),
-                signed_per_target[removal_order].cumsum(dim=0),
+                rms_scores[removal_order].cumsum(dim=0),
             ))
-            if signed_sum.shape != (int(text_config.num_experts),):
-                raise RuntimeError(f"Layer {layer} has a malformed sensitivity vector")
-            if not torch.isfinite(signed_sum).all() or not torch.isfinite(reap_scores).all():
-                raise RuntimeError(f"Layer {layer} contains non-finite REAP or sensitivity values")
-            layer_state["sensitivity_first_order_signed_sum"] = signed_sum
-            layer_state["sensitivity_first_order_per_target_token"] = signed_per_target
-            layer_state["sensitivity_removal_order_ascending_reap"] = removal_order
-            layer_state["sensitivity_cumulative_ascending_reap"] = cumulative
+            if rms_scores.shape != (int(text_config.num_experts),):
+                raise RuntimeError(f"Layer {layer} has a malformed RMS-L2 score vector")
+            if (
+                not torch.isfinite(rms_scores).all()
+                or not torch.isfinite(reap_scores).all()
+            ):
+                raise RuntimeError(f"Layer {layer} contains non-finite REAP or RMS-L2 values")
+            layer_state["local_output_sensitivity_rms_l2"] = rms_scores
+            layer_state["local_output_sensitivity_occurrence_count"] = occurrence_count
+            layer_state["local_output_sensitivity_removal_order_ascending_reap"] = removal_order
+            layer_state["local_output_sensitivity_cumulative_rms_l2_ascending_reap"] = cumulative
             sensitivity_results[layer] = {
-                "signed_sum": signed_sum,
-                "per_target_token": signed_per_target,
+                "rms_l2_by_expert": rms_scores,
+                "occurrence_count_by_expert": occurrence_count,
                 "ascending_reap_expert_ids": removal_order,
-                "cumulative_first_order_estimate": cumulative,
+                "cumulative_rms_l2_heuristic": cumulative,
             }
 
     if not SENSITIVITY_MODE:
@@ -1498,11 +1588,14 @@ def main() -> None:
         if SENSITIVITY_MODE:
             torch.save(
                 {
-                    "interpretation": "first-order Taylor estimates; not exact multi-expert damage curves",
-                    "target_token_count": target_tokens,
+                    "interpretation": (
+                        "per-expert one-at-a-time local MoE-output RMS-L2 deltas; "
+                        "the cumulative curve is a ranking heuristic, not a multi-expert damage estimate"
+                    ),
+                    "processed_token_count": processed_tokens,
                     "layers": sensitivity_results,
                 },
-                output_dir / "sensitivity_results.pt",
+                output_dir / "local_output_sensitivity_results.pt",
             )
     metadata = {
         "model_path": MODEL_PATH, "model_type": config.model_type,
@@ -1532,26 +1625,31 @@ def main() -> None:
     }
     if SENSITIVITY_MODE:
         metadata.update({
-            "mode": "single_run_first_order_pruning_sensitivity",
+            "mode": "single_run_local_output_sensitivity",
             "smoke_test": SENSITIVITY_SMOKE_SAMPLES > 0,
             "requested_sample_count": MAX_SAMPLES,
             "retained_examples": total_examples,
             "selected_row_indices_file": "sample_manifest.json",
             "sample_set_sha256": sample_manifest["sample_set_sha256"],
-            "target_tokens": target_tokens,
-            "target_positions": "1..L-1 inclusive; shifted causal next-token cross-entropy",
-            "loss_reduction": "sum during backward; reported estimates divided by all target tokens",
+            "processed_tokens": processed_tokens,
             "max_sequence_length": MODEL_MAX_LENGTH,
             "packing": False,
             "truncation": False,
             "padding": False,
             "selection_without_replacement": True,
             "sensitivity": {
-                "kind": "first_order_taylor_projection",
-                "counterfactual": "top-11 candidates; remove one top-10 expert, substitute candidate 11, renormalize router weights",
-                "curves": "cumulative layerwise estimates in ascending-REAP removal order",
+                "kind": "per_expert_local_output_rms_l2",
+                "counterfactual": (
+                    "for each token, replace each selected top-10 expert in turn with "
+                    "candidate 11 and renormalize the top-10 router weights"
+                ),
+                "aggregation": "sqrt(sum squared MoE-output delta L2 / expert occurrence count)",
+                "curves": (
+                    "cumulative sum of independent per-expert RMS-L2 scores in "
+                    "ascending-REAP removal order; ranking heuristic only"
+                ),
+                "gradient_or_loss_sensitivity": False,
                 "exact_multi_expert_damage": False,
-                "teacher_model": None,
             },
             "router_stability": {
                 "top_k": int(text_config.num_experts_per_tok),
@@ -1565,6 +1663,21 @@ def main() -> None:
         })
     if rank == 0:
         (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+        if SENSITIVITY_MODE:
+            (output_dir / "local_output_sensitivity_run_status.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "complete": True,
+                        "sample_set_sha256": sample_manifest["sample_set_sha256"],
+                        "processed_examples": total_examples,
+                        "processed_tokens": total_tokens,
+                        "calibration_scores_written": True,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
         print(json.dumps(metadata, indent=2))
     if ep_enabled:
         assert dist is not None

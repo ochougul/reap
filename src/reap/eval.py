@@ -226,10 +226,24 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
     )
     logger.info(f"Command: {' '.join(server_command)}")
 
+    server_env = os.environ.copy()
+    # Padded non-uniform checkpoints opt into a small sitecustomize patch. It
+    # masks router logits inside vLLM after the gate GEMM and before either
+    # modular or monolithic fused-MoE routing.
+    metadata_path = pathlib.Path(model_name) / "nonuniform_metadata.json"
+    if metadata_path.exists():
+        server_env["REAP_QWEN38_MASK_METADATA"] = str(metadata_path.resolve())
+        source_root = pathlib.Path(__file__).resolve().parents[1]
+        existing_pythonpath = server_env.get("PYTHONPATH", "")
+        server_env["PYTHONPATH"] = str(source_root) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
+        )
+        logger.info("Enabled padded-expert routing mask: %s", metadata_path)
+
     # Start the server process with log redirection
     with open(log_file, "w") as log_file:
         process = subprocess.Popen(
-            server_command, stdout=log_file, stderr=subprocess.STDOUT
+            server_command, stdout=log_file, stderr=subprocess.STDOUT, env=server_env
         )
 
     base_url = f"http://0.0.0.0:{port}"

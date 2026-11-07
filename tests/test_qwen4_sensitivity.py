@@ -1,51 +1,95 @@
 import torch
 
-from experiments.qwen4_calibrate import _first_order_top11_removal
+from experiments.qwen4_calibrate import (
+    _local_output_rms,
+    _top11_local_output_delta_squares,
+)
 
 
-def test_top11_first_order_estimate_matches_direct_small_case():
-    candidate_ids = torch.arange(11).reshape(1, 11)
-    probabilities = torch.tensor(
-        [[0.21, 0.16, 0.13, 0.11, 0.09, 0.08, 0.07, 0.06, 0.04, 0.03, 0.02]],
+def _direct_counterfactuals(ids, probs, outputs, scales):
+    squared_sum = torch.zeros(int(ids.max()) + 1, dtype=torch.float64)
+    counts = torch.zeros(int(ids.max()) + 1, dtype=torch.long)
+    for token in range(ids.shape[0]):
+        base_weights = probs[token, :10] / probs[token, :10].sum()
+        baseline = scales[token] * (base_weights[:, None] * outputs[token, :10]).sum(0)
+        for slot in range(10):
+            replacement_weights = probs[token].clone()
+            replacement_weights[slot] = 0
+            replacement_weights /= replacement_weights.sum()
+            counterfactual = scales[token] * (
+                replacement_weights[:, None] * outputs[token]
+            ).sum(0)
+            delta_square = (counterfactual - baseline).square().sum()
+            expert = int(ids[token, slot])
+            squared_sum[expert] += delta_square.double()
+            counts[expert] += 1
+    return squared_sum, counts
+
+
+def test_top11_local_output_deltas_match_direct_counterfactuals_and_slot_mapping():
+    selected_ids = torch.tensor(
+        [list(range(10)), list(range(2, 12))], dtype=torch.long
+    )
+    candidate_ids = torch.cat(
+        [selected_ids, torch.tensor([[10], [12]], dtype=torch.long)], dim=-1
+    )
+    logits = torch.tensor(
+        [
+            [2.1, 1.9, 1.7, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.3, 0.1],
+            [2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.4, 0.2, 0.0],
+        ],
         dtype=torch.float64,
     )
-    expert_outputs = torch.tensor(
-        [[1.2, -0.7, 0.3, 2.0, -1.1, 0.4, 0.8, -0.2, 0.5, 1.7, -1.3]],
+    probs = logits.softmax(dim=-1)
+    scales = torch.tensor([1.3, 0.7], dtype=torch.float64)
+    selected_weights = scales[:, None] * probs[:, :10] / probs[:, :10].sum(-1, keepdim=True)
+    all_outputs = torch.tensor(
+        [
+            [[i * 0.2 - 0.5, i * -0.1 + 0.3, (i % 3) * 0.4] for i in range(11)],
+            [[i * -0.15 + 0.7, i * 0.25 - 0.2, (i % 4) * -0.3] for i in range(11)],
+        ],
         dtype=torch.float64,
     )
-    gradient = torch.tensor([0.6], dtype=torch.float64)
-    projected = expert_outputs * gradient
-    routed_scale = torch.tensor([1.4], dtype=torch.float64)
 
-    ids, estimates = _first_order_top11_removal(
-        candidate_ids, probabilities, projected, routed_scale
+    # Simulate the expert dispatcher: rows are sorted by expert ID, and each
+    # permutation value maps back to flattened (token, top-k slot) order.
+    original_rows = torch.arange(selected_ids.numel())
+    flat_ids = selected_ids.reshape(-1)
+    sort_order = torch.argsort(flat_ids, stable=True)
+    permutation = original_rows[sort_order]
+    sorted_experts = flat_ids[sort_order]
+    flattened_outputs = all_outputs[:, :10].reshape(-1, all_outputs.shape[-1])
+    sorted_outputs = flattened_outputs[sort_order]
+
+    actual_sum, actual_count = _top11_local_output_delta_squares(
+        candidate_probs=probs.float(),
+        selected_ids=selected_ids,
+        selected_weights=selected_weights.float(),
+        routed_scale=scales,
+        eleventh_output=all_outputs[:, 10].float(),
+        expert_ids=sorted_experts,
+        expert_outputs=sorted_outputs.float(),
+        route_permutation=permutation,
+        num_experts=13,
+        chunk_tokens=1,
+    )
+    expected_sum, expected_count = _direct_counterfactuals(
+        selected_ids, probs, all_outputs, scales
     )
 
-    p11 = probabilities[0] / probabilities[0].sum()
-    base_weights = p11[:10] / p11[:10].sum()
-    base_output = (base_weights * expert_outputs[0, :10]).sum()
-    direct = []
-    for removed in range(10):
-        keep = [index for index in range(11) if index != removed]
-        weights = p11[keep] / p11[keep].sum()
-        removed_output = (weights * expert_outputs[0, keep]).sum()
-        direct.append((removed_output - base_output) * gradient.item() * routed_scale.item())
-
-    assert torch.equal(ids, candidate_ids[:, :10])
-    torch.testing.assert_close(estimates[0], torch.tensor(direct, dtype=torch.float32))
+    torch.testing.assert_close(actual_sum[: expected_sum.numel()], expected_sum, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual_count[: expected_count.numel()], expected_count)
+    assert actual_sum[12] == 0
+    assert actual_count[12] == 0
 
 
-def test_top11_estimates_are_independent_per_token():
-    ids = torch.arange(22).reshape(2, 11)
-    probabilities = torch.softmax(torch.arange(22, dtype=torch.float32).reshape(2, 11), -1)
-    projected = torch.tensor(
-        [list(range(11)), list(range(10, -1, -1))], dtype=torch.float32
+def test_local_output_rms_is_aggregated_over_expert_occurrences():
+    squared_sum = torch.tensor([20.0, 18.0, 0.0, 7.0], dtype=torch.float64)
+    occurrences = torch.tensor([5, 2, 0, 1], dtype=torch.long)
+
+    scores = _local_output_rms(squared_sum, occurrences)
+
+    torch.testing.assert_close(
+        scores,
+        torch.tensor([2.0, 3.0, 0.0, 7.0**0.5], dtype=torch.float64),
     )
-    _, estimates = _first_order_top11_removal(ids, probabilities, projected)
-    _, first = _first_order_top11_removal(ids[:1], probabilities[:1], projected[:1])
-    _, second = _first_order_top11_removal(ids[1:], probabilities[1:], projected[1:])
-
-    torch.testing.assert_close(estimates[:1], first)
-    torch.testing.assert_close(estimates[1:], second)
-    assert (estimates[0] > 0).any()
-    assert (estimates[1] < 0).any()
