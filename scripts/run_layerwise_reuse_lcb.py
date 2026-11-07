@@ -374,7 +374,7 @@ def verify_ports_available(ports: list[int]) -> None:
                 raise RuntimeError(f"Requested vLLM port {port} is unavailable") from exc
 
 
-def prepare_model(candidate: Candidate) -> tuple[Path, Path]:
+def prepare_model(candidate: Candidate) -> tuple[Path, Path, str]:
     candidate.run_dir.mkdir(parents=True, exist_ok=False)
     model_dir = candidate.run_dir / "Qwen3.8-Flash-Next-FP8"
     model_dir.mkdir()
@@ -385,10 +385,60 @@ def prepare_model(candidate: Candidate) -> tuple[Path, Path]:
         raise RuntimeError(f"Missing model.safetensors.index.json in {candidate.checkpoint}")
     if not any(re.fullmatch(r"model-\d+-of-\d+\.safetensors", path.name) for path in checkpoint_files):
         raise RuntimeError(f"No sharded FP8 model weights found in {candidate.checkpoint}")
-    for source in checkpoint_files:
-        (model_dir / source.name).symlink_to(source.resolve())
-
     removed_by_layer = candidate.removed_by_layer
+    # Equal retained-expert counts can be represented directly in vLLM's
+    # native expert-parallel layout. The source shards remain symlinked; a
+    # small load-time map compacts router rows and expert IDs, avoiding a
+    # second ~173-GiB checkpoint and the runtime mask used for non-uniform
+    # allocations.
+    removal_counts = {len(ids) for ids in removed_by_layer.values()}
+    compact_uniform = len(removal_counts) == 1
+    source_config = read_json(candidate.checkpoint / "config.json")
+    for source in checkpoint_files:
+        target = model_dir / source.name
+        if source.name == "config.json":
+            if not compact_uniform:
+                target.symlink_to(source.resolve())
+                continue
+            text_config = source_config.get("text_config")
+            if not isinstance(text_config, dict):
+                raise RuntimeError("Expected Qwen4-Exp config with a text_config object")
+            retained_counts = {
+                candidate.num_experts - len(ids)
+                for ids in removed_by_layer.values()
+            }
+            if len(retained_counts) != 1:
+                raise RuntimeError("Uniform compaction requires equal retained counts")
+            compact_config = dict(source_config)
+            compact_text_config = dict(text_config)
+            compact_text_config["num_experts"] = retained_counts.pop()
+            compact_config["text_config"] = compact_text_config
+            target.write_bytes(stable_json_bytes(compact_config))
+        else:
+            target.symlink_to(source.resolve())
+
+    if compact_uniform:
+        retained_ids = {
+            str(layer): [
+                expert_id
+                for expert_id in range(candidate.num_experts)
+                if expert_id not in set(removed_by_layer[layer])
+            ]
+            for layer in range(candidate.num_layers)
+        }
+        compact_metadata = {
+            "variant": candidate.variant,
+            "source_allocation_manifest": str(candidate.manifest_path),
+            "source_allocation_sha256": candidate.manifest_sha256,
+            "original_experts": candidate.num_experts,
+            "retained_experts_per_layer": len(next(iter(retained_ids.values()))),
+            "retained_original_ids_by_layer": retained_ids,
+            "routing": "compact router and experts; no runtime routing mask",
+        }
+        metadata_path = model_dir / "expert_compaction.json"
+        metadata_path.write_bytes(stable_json_bytes(compact_metadata))
+        return model_dir, metadata_path, "native-vllm-expert-parallel-compact"
+
     valid_masks: dict[str, list[int]] = {}
     for layer in range(candidate.num_layers):
         removed_ids = set(removed_by_layer[layer])
@@ -421,7 +471,7 @@ def prepare_model(candidate: Candidate) -> tuple[Path, Path]:
     metadata_path = model_dir / "nonuniform_metadata.json"
     with metadata_path.open("xb") as stream:
         stream.write(stable_json_bytes(metadata))
-    return model_dir, metadata_path
+    return model_dir, metadata_path, "masked-original-expert-layout"
 
 
 def expected_output_paths(results_dir: Path) -> dict[str, Path]:
@@ -543,9 +593,11 @@ def run_candidate(
         "output_sha256": {},
         "return_code": None,
         "passed_validation": False,
+        "inference_mode": None,
     }
     try:
-        model_dir, metadata_path = prepare_model(candidate)
+        model_dir, metadata_path, inference_mode = prepare_model(candidate)
+        record["inference_mode"] = inference_mode
         results_dir = candidate.run_dir / "results"
         results_dir.mkdir()
         outputs = expected_output_paths(results_dir)
@@ -559,9 +611,12 @@ def run_candidate(
                 "HF_DATASETS_OFFLINE": "1",
                 "PYTHONPATH": str(REPO_ROOT / "src")
                 + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""),
-                "REAP_QWEN38_MASK_METADATA": str(metadata_path),
             }
         )
+        if inference_mode == "masked-original-expert-layout":
+            env["REAP_QWEN38_MASK_METADATA"] = str(metadata_path)
+        else:
+            env.pop("REAP_QWEN38_MASK_METADATA", None)
         venv_bin = python_executable.parent
         env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
         with (candidate.run_dir / "runner.log").open("x") as log:
@@ -734,7 +789,10 @@ def main() -> int:
     allocation_root = args.allocation_root.expanduser().resolve()
     checkpoint_override = args.checkpoint.expanduser() if args.checkpoint else None
     python_executable = (
-        args.python.expanduser().resolve()
+        # Preserve a venv's `bin/python` symlink. Resolving it points at the
+        # base interpreter and loses the venv's site-packages when this script
+        # launches eval.py in a subprocess.
+        Path(os.path.abspath(args.python.expanduser()))
         if args.python
         else REPO_ROOT / ".venv-eval/bin/python"
     )

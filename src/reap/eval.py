@@ -239,6 +239,21 @@ def start_server(model_name, model_args, eval_args, seed, log_file, port):
             os.pathsep + existing_pythonpath if existing_pythonpath else ""
         )
         logger.info("Enabled padded-expert routing mask: %s", metadata_path)
+    compaction_path = pathlib.Path(model_name) / "expert_compaction.json"
+    if compaction_path.exists():
+        if metadata_path.exists():
+            raise RuntimeError(
+                "Model directory cannot combine compact expert loading and a router mask"
+            )
+        server_env["REAP_QWEN38_COMPACTION_METADATA"] = str(
+            compaction_path.resolve()
+        )
+        source_root = pathlib.Path(__file__).resolve().parents[1]
+        existing_pythonpath = server_env.get("PYTHONPATH", "")
+        server_env["PYTHONPATH"] = str(source_root) + (
+            os.pathsep + existing_pythonpath if existing_pythonpath else ""
+        )
+        logger.info("Enabled compact native expert-parallel loading: %s", compaction_path)
 
     # Start the server process with log redirection
     with open(log_file, "w") as log_file:
