@@ -96,9 +96,14 @@ starts evaluation in a fresh process, saves results below `--output-dir/eval`,
 and removes the checkpoint afterward. Use `--save-checkpoint` without
 `--run-eval` when a persistent checkpoint is desired.
 
+## Fisher expert scores
+
+A joint REAP + stability + Fisher calibration (12,228 unpacked samples) is documented in [FISHER_SCORES.md](FISHER_SCORES.md).
+
 ## Files that make this workflow portable
 
 - `experiments/seap-sharded.py`: configurable multi-GPU calibration runner.
+- `experiments/fisher-sharded.py`, `src/reap/fisher.py`, `src/reap/joint_calibration.py`: joint REAP + stability + Fisher calibration (see the Fisher section).
 - `scripts/build_seap_states.py`: offline lambda/delta state construction.
 - `experiments/prune_seap_state.py`: score selection, pruning, and evaluation.
 - `src/reap/seap.py`: stability accumulation and SEAP score definition.
